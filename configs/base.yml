@@ -1,0 +1,10 @@
+# configs/base.yaml
+data:
+  dedup_threshold: 2      # dual pHash+dHash agreement; validated against the
+                          # glioma negative control (0.6% removal)
+  group_threshold: 8      # chosen from a sensitivity sweep over 4-12; glioma
+                          # group count is invariant across the sweep
+  seed: 42
+split:
+  outer_folds: 5
+  inner_folds: 3
