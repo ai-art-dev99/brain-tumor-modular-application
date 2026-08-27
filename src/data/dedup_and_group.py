@@ -49,16 +49,16 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from PIL import Image
 
 MANIFEST = Path("/workspace/data/manifest")
+INSPECT_DIR = MANIFEST / "cluster_montages"
 
 # =============================================================================
-# Inclusion / exclusion rules -- reviewer point 2 asks for these explicitly,
-# so they live in one auditable place rather than being scattered through code.
+# Inclusion / exclusion rules (reviewer point 2 asks for these explicitly)
 # =============================================================================
 
 INCLUSION = {
-    # class      : list of (source, source_class) pairs to draw from
     "glioma":     [("figshare", "glioma")],
     "meningioma": [("figshare", "meningioma"), ("sartaj", "meningioma")],
     "pituitary":  [("figshare", "pituitary"), ("sartaj", "pituitary")],
@@ -71,25 +71,53 @@ EXCLUSION_RATIONALE = {
         "gliomas are drawn from Figshare instead.",
     ("sartaj", "notumor"):
         "500 files reduce to 352 unique hashes (29.6% internally duplicated), "
-        "of which 120 are byte-identical to BR35H images.",
+        "120 of which are byte-identical to BR35H images.",
     ("br35h", "tumour_unspecified"):
-        "BR35H 'yes' images are tumours of unspecified histology and cannot be "
-        "assigned to one of the four diagnostic classes.",
+        "BR35H 'yes' images are tumours of unspecified histology.",
     ("br35h", "unknown"):
-        "Br35H-Mask-RCNN directory is a byte-identical repackaging of the "
-        "'yes' folder for an object-detection task.",
+        "Br35H-Mask-RCNN is a byte-identical repackaging of 'yes'.",
     ("br35h", "unlabelled"):
-        "'pred' directory carries no ground-truth labels.",
+        "'pred' carries no ground-truth labels.",
 }
 
 
 # =============================================================================
-# Union-find
+# Hashing utilities
 # =============================================================================
 
-class DSU:
-    """Disjoint-set union with path compression."""
+POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
+
+def hex_to_packed(series: pd.Series) -> np.ndarray:
+    """
+    Hex hash strings -> (n, 8) uint8.
+
+    Bit ordering does not matter here: Hamming distance is invariant under any
+    permutation applied identically to both operands, and hashes are only ever
+    compared against hashes of the same family.
+    """
+    return np.array([np.frombuffer(bytes.fromhex(h), dtype=np.uint8)
+                     for h in series], dtype=np.uint8)
+
+
+def dual_hash_edges(ph: np.ndarray, dh: np.ndarray, threshold: int,
+                    chunk: int = 512) -> list[tuple[int, int]]:
+    """Index pairs within `threshold` bits on pHash AND on dHash."""
+    n = len(ph)
+    edges: list[tuple[int, int]] = []
+    for s in range(0, n, chunk):
+        e = min(s + chunk, n)
+        dp = POPCOUNT[ph[s:e, None, :] ^ ph[None, :, :]].sum(axis=2)
+        dd = POPCOUNT[dh[s:e, None, :] ^ dh[None, :, :]].sum(axis=2)
+        rows, cols = np.where((dp <= threshold) & (dd <= threshold))
+        for r, c in zip(rows, cols):
+            i, j = s + int(r), int(c)
+            if i < j:
+                edges.append((i, j))
+    return edges
+
+
+class DSU:
     def __init__(self, n: int):
         self.p = list(range(n))
         self.r = [0] * n
@@ -111,208 +139,218 @@ class DSU:
             self.r[ra] += 1
 
 
-POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
-
-
-def near_duplicate_edges(packed: np.ndarray, threshold: int,
-                         chunk: int = 512) -> list[tuple[int, int]]:
-    """
-    All index pairs whose packed pHashes lie within `threshold` bits.
-
-    Brute force over ~6k images is ~18M comparisons: a few seconds with
-    numpy, and exact. An ANN index would be needed only at a much larger
-    scale, and would trade away the exactness that makes this auditable.
-    """
-    n = len(packed)
-    edges: list[tuple[int, int]] = []
-    for s in range(0, n, chunk):
-        e = min(s + chunk, n)
-        d = POPCOUNT[packed[s:e, None, :] ^ packed[None, :, :]].sum(axis=2)
-        # Keep the upper triangle only, so each pair is emitted once.
-        rows, cols = np.where(d <= threshold)
-        for r, c in zip(rows, cols):
-            i = s + int(r)
-            j = int(c)
-            if i < j:
-                edges.append((i, j))
-    return edges
-
-
 # =============================================================================
 
-def build(phash_threshold: int, dry_run: bool) -> pd.DataFrame:
+def load_all() -> pd.DataFrame:
+    """Unify the Figshare index and the loose-file index into one table."""
     files = pd.read_csv(MANIFEST / "files_index.csv")
-    packed_all = np.load(MANIFEST / "files_phash.npy")
     fig = pd.read_csv(MANIFEST / "figshare_index.csv")
 
-    # -- 1. apply inclusion rules ---------------------------------------------
+    files = files[["path", "source", "class", "width", "height",
+                   "bytes", "sha256", "phash", "dhash"]].copy()
+    files["patient_id"] = ""
+    files["mask_path"] = ""
+
+    fig_rows = pd.DataFrame({
+        "path": fig.render_path,
+        "source": "figshare",
+        "class": fig["class"],
+        "width": fig.width,
+        "height": fig.height,
+        # Renders are lossless PNG of identical dimensions, so file size
+        # carries no quality signal here; a constant keeps representative
+        # selection from preferring Figshare arbitrarily.
+        "bytes": 0,
+        "sha256": "",
+        "phash": fig.phash,
+        "dhash": fig.dhash,
+        "patient_id": fig.patient_id,
+        "mask_path": fig.mask_path,
+    })
+
+    df = pd.concat([files, fig_rows], ignore_index=True)
+    return df
+
+
+def build(dedup_t: int, group_t: int, dry_run: bool, inspect: int) -> pd.DataFrame:
+    df_all = load_all()
+
+    # -- 1. curation ----------------------------------------------------------
     print("=" * 70)
     print("1. Curating the dataset")
     print("=" * 70)
 
-    keep = np.zeros(len(files), dtype=bool)
-    assigned = np.full(len(files), "", dtype=object)
+    keep = np.zeros(len(df_all), dtype=bool)
+    assigned = np.full(len(df_all), "", dtype=object)
     for cls, pairs in INCLUSION.items():
         for src, src_cls in pairs:
-            m = ((files.source == src) & (files["class"] == src_cls)).to_numpy()
+            m = ((df_all.source == src) & (df_all["class"] == src_cls)).to_numpy()
+            if not m.any():
+                print(f"  WARNING: no images matched {src}/{src_cls}")
             keep |= m
             assigned[m] = cls
-            print(f"  {cls:<12} <- {src:<10} {src_cls:<20} {int(m.sum()):5d}")
+            print(f"  {cls:<12} <- {src:<10} {src_cls:<14} {int(m.sum()):5d}")
 
     print("\n  excluded:")
     for (src, src_cls), why in EXCLUSION_RATIONALE.items():
-        n = int(((files.source == src) & (files["class"] == src_cls)).sum())
+        n = int(((df_all.source == src) & (df_all["class"] == src_cls)).sum())
         if n:
             print(f"    {src}/{src_cls} ({n}): {why}")
 
-    df = files[keep].copy().reset_index(drop=True)
+    df = df_all[keep].copy().reset_index(drop=True)
     df["label"] = assigned[keep]
-    packed = packed_all[keep]
     print(f"\n  curated total: {len(df)}")
     print(df.label.value_counts().to_string())
+    print("\n  by source:")
+    print(pd.crosstab(df.source, df.label).to_string())
 
-    # -- 2. attach Figshare metadata ------------------------------------------
-    # Figshare images are indexed from the .mat renders, so the patient ID is
-    # a direct join rather than a perceptual match.
+    ph = hex_to_packed(df.phash)
+    dh = hex_to_packed(df.dhash)
+
+    has_pid = df.patient_id.fillna("") != ""
+    print(f"\n  with true patient ID: {int(has_pid.sum())} "
+          f"({100 * has_pid.mean():.1f}%), "
+          f"{df.patient_id[has_pid].nunique()} patients")
+
+    # -- 2. deduplication (tight) ---------------------------------------------
     print()
     print("=" * 70)
-    print("2. Attaching patient identifiers")
+    print(f"2. Near-duplicate removal (dual-hash threshold = {dedup_t})")
     print("=" * 70)
 
-    fig_by_render = fig.set_index("render_path")
-    pid = []
-    mask = []
-    for p, src in zip(df.path, df.source):
-        if src == "figshare" and p in fig_by_render.index:
-            pid.append(fig_by_render.at[p, "patient_id"])
-            mask.append(fig_by_render.at[p, "mask_path"])
-        else:
-            pid.append("")
-            mask.append("")
-    df["patient_id"] = pid
-    df["mask_path"] = mask
+    dup_edges = dual_hash_edges(ph, dh, dedup_t)
+    dup = DSU(len(df))
+    for i, j in dup_edges:
+        dup.union(i, j)
+    df["dup_cluster"] = [dup.find(i) for i in range(len(df))]
 
-    has_pid = df.patient_id != ""
-    print(f"  images with a true patient ID : {int(has_pid.sum())} "
-          f"({100 * has_pid.mean():.1f}%)")
-    print(f"  distinct patients             : {df.patient_id[has_pid].nunique()}")
-    print(f"  images without any identifier : {int((~has_pid).sum())} "
-          f"-> pseudo-patient grouping only")
+    order = df.sort_values(["dup_cluster", "bytes"], ascending=[True, False])
+    rep_idx = set(order.drop_duplicates("dup_cluster", keep="first").index)
+    df["is_representative"] = df.index.isin(rep_idx)
 
-    # -- 3. build the grouping graph ------------------------------------------
-    print()
-    print("=" * 70)
-    print(f"3. Grouping (pHash threshold = {phash_threshold})")
-    print("=" * 70)
+    n_rm = int((~df.is_representative).sum())
+    print(f"  edges           : {len(dup_edges)}")
+    print(f"  clusters        : {df.dup_cluster.nunique()}")
+    print(f"  images removed  : {n_rm} ({100 * n_rm / len(df):.1f}%)")
 
-    dsu = DSU(len(df))
-
-    # Edge type A: shared patient ID. Metadata-backed, always trusted.
-    n_pid_edges = 0
-    for _, idx in df[has_pid].groupby("patient_id").groups.items():
-        idx = list(idx)
-        for j in idx[1:]:
-            dsu.union(idx[0], j)
-            n_pid_edges += 1
-    print(f"  edges from shared patient ID : {n_pid_edges}")
-
-    # Edge type B: perceptual similarity.
-    edges = near_duplicate_edges(packed, phash_threshold)
-    for i, j in edges:
-        dsu.union(i, j)
-    print(f"  edges from pHash similarity  : {len(edges)}")
-
-    df["group_id"] = [f"g{dsu.find(i):05d}" for i in range(len(df))]
-    n_groups = df.group_id.nunique()
-    print(f"\n  resulting groups: {n_groups}")
-
-    sizes = df.groupby("group_id").size()
-    print(f"  group size: min {sizes.min()}  median {sizes.median():.0f}  "
-          f"mean {sizes.mean():.1f}  max {sizes.max()}")
-
-    # A group that swallowed many patients means the threshold is too loose and
-    # the split will be starved of independent units. Surface it rather than
-    # letting it distort the folds silently.
-    merged = (df[has_pid].groupby("group_id").patient_id.nunique())
-    multi = merged[merged > 1]
-    if len(multi):
-        print(f"\n  groups spanning >1 patient ID: {len(multi)} "
-              f"(largest merges {multi.max()} patients)")
-        print("  -> conservative: these patients share near-identical images, "
-              "so keeping\n     them together is correct. If the largest is "
-              "implausible, lower the threshold.")
-
-    # Cross-class groups are a red flag: near-identical images filed under two
-    # diagnoses. Report, then let the split keep them together anyway.
-    cls_span = df.groupby("group_id").label.nunique()
-    n_cls_span = int((cls_span > 1).sum())
-    print(f"\n  groups spanning >1 class: {n_cls_span}")
-    if n_cls_span:
-        bad = df[df.group_id.isin(cls_span[cls_span > 1].index)]
-        print(pd.crosstab(bad.group_id, bad.label).sum().to_string())
-        bad.to_csv(MANIFEST / "cross_class_groups.csv", index=False)
-        print(f"  -> written to {MANIFEST / 'cross_class_groups.csv'} for review")
-
-    # -- 4. select one representative per near-duplicate cluster ---------------
-    # Distinct slices of one patient are NOT duplicates and must be kept: they
-    # are legitimate independent-ish samples once grouping prevents leakage.
-    # Only images that are near-identical to each other are collapsed.
-    print()
-    print("=" * 70)
-    print("4. Removing near-duplicate images")
-    print("=" * 70)
-
-    dup_dsu = DSU(len(df))
-    for i, j in edges:
-        dup_dsu.union(i, j)
-    df["dup_cluster"] = [dup_dsu.find(i) for i in range(len(df))]
-
-    # Prefer the largest file in each cluster: least re-compressed, so least
-    # information already discarded.
-    df = df.sort_values(["dup_cluster", "bytes"], ascending=[True, False])
-    df["is_representative"] = ~df.duplicated("dup_cluster", keep="first")
-
-    n_removed = int((~df.is_representative).sum())
-    print(f"  near-duplicate clusters : {df.dup_cluster.nunique()}")
-    print(f"  images removed          : {n_removed} "
-          f"({100 * n_removed / len(df):.1f}%)")
-
-    final = df[df.is_representative].copy().reset_index(drop=True)
-    print(f"  final dataset           : {len(final)}")
-    print()
-    print("  class counts before -> after deduplication:")
-    before = df.label.value_counts()
-    after = final.label.value_counts()
-    comp = pd.DataFrame({"before": before, "after": after})
+    comp = pd.DataFrame({
+        "before": df.label.value_counts(),
+        "after": df[df.is_representative].label.value_counts(),
+    })
     comp["removed"] = comp.before - comp.after
     comp["pct"] = (100 * comp.removed / comp.before).round(1)
-    print(comp.to_string())
+    print("\n" + comp.to_string())
 
+    if inspect:
+        write_montages(df, dup_edges, inspect)
+
+    final = df[df.is_representative].copy().reset_index(drop=True)
+    ph_f = ph[df.is_representative.to_numpy()]
+    dh_f = dh[df.is_representative.to_numpy()]
+
+    # -- 3. grouping (loose) --------------------------------------------------
     print()
-    print("  groups remaining:", final.group_id.nunique())
-    gs = final.groupby("group_id").size()
-    print(f"  images per group: median {gs.median():.0f}  max {gs.max()}")
+    print("=" * 70)
+    print(f"3. Grouping (patient ID + dual-hash threshold = {group_t})")
+    print("=" * 70)
+
+    grp = DSU(len(final))
+
+    n_pid = 0
+    fpid = final.patient_id.fillna("")
+    for _, idx in final[fpid != ""].groupby("patient_id").groups.items():
+        idx = list(idx)
+        for j in idx[1:]:
+            grp.union(idx[0], j)
+            n_pid += 1
+    print(f"  edges from patient ID : {n_pid}")
+
+    grp_edges = dual_hash_edges(ph_f, dh_f, group_t)
+    for i, j in grp_edges:
+        grp.union(i, j)
+    print(f"  edges from similarity : {len(grp_edges)}")
+
+    final["group_id"] = [f"g{grp.find(i):05d}" for i in range(len(final))]
+    sizes = final.groupby("group_id").size()
+    print(f"\n  groups          : {final.group_id.nunique()}")
+    print(f"  images per group: min {sizes.min()}  median {sizes.median():.0f}  "
+          f"mean {sizes.mean():.1f}  max {sizes.max()}")
+
+    # Independent units per class is the real constraint on how finely the data
+    # can be split. Fewer groups than folds in any class makes CV impossible.
+    print("\n  groups per class:")
+    print(final.groupby("label").group_id.nunique().to_string())
+
+    fpid = final.patient_id.fillna("")
+    merged = final[fpid != ""].groupby("group_id").patient_id.nunique()
+    multi = merged[merged > 1]
+    if len(multi):
+        print(f"\n  groups merging >1 patient: {len(multi)} "
+              f"(largest merges {multi.max()})")
+        if multi.max() > 10:
+            print("  -> a group swallowing this many patients suggests "
+                  "--group-threshold\n     is too loose; it starves the split "
+                  "of independent units.")
+
+    cls_span = final.groupby("group_id").label.nunique()
+    n_span = int((cls_span > 1).sum())
+    print(f"\n  groups spanning >1 class: {n_span}")
+    if n_span:
+        bad = final[final.group_id.isin(cls_span[cls_span > 1].index)]
+        bad.to_csv(MANIFEST / "cross_class_groups.csv", index=False)
+        print(f"  -> {MANIFEST / 'cross_class_groups.csv'} -- inspect these")
 
     if not dry_run:
-        out = MANIFEST / "dataset.csv"
-        final.to_csv(out, index=False)
-        print(f"\n  wrote {out}")
-        df.to_csv(MANIFEST / "dataset_full_with_dups.csv", index=False)
+        final.to_csv(MANIFEST / "dataset.csv", index=False)
+        df.to_csv(MANIFEST / "dataset_with_duplicates.csv", index=False)
+        print(f"\n  wrote {MANIFEST / 'dataset.csv'} ({len(final)} images)")
     else:
         print("\n  --dry-run: nothing written")
 
     return final
 
 
+def write_montages(df: pd.DataFrame, edges: list[tuple[int, int]],
+                   n_clusters: int, per_row: int = 6, thumb: int = 140) -> None:
+    """
+    Render the largest duplicate clusters so the removal decision can be
+    checked by eye rather than taken on trust.
+    """
+    INSPECT_DIR.mkdir(parents=True, exist_ok=True)
+    sizes = df.groupby("dup_cluster").size().sort_values(ascending=False)
+    targets = sizes[sizes > 1].head(n_clusters)
+    print(f"\n  writing {len(targets)} montages to {INSPECT_DIR}")
+
+    for rank, (cid, n) in enumerate(targets.items(), 1):
+        paths = df[df.dup_cluster == cid].path.tolist()[:per_row * 3]
+        cols = min(per_row, len(paths))
+        rows = (len(paths) + cols - 1) // cols
+        sheet = Image.new("RGB", (cols * thumb, rows * thumb), "black")
+        for k, p in enumerate(paths):
+            try:
+                im = Image.open(p).convert("RGB").resize((thumb, thumb))
+            except Exception:
+                continue
+            sheet.paste(im, ((k % cols) * thumb, (k // cols) * thumb))
+        sheet.save(INSPECT_DIR / f"cluster{rank:02d}_n{n}.png")
+
+    print("  -> if images in a montage are visibly different scans, the "
+          "threshold is\n     too loose and real data is being discarded.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--phash-threshold", type=int, default=6,
-                    help="pHash Hamming distance below which two images are "
-                         "treated as near-duplicates and grouped")
+    ap.add_argument("--dedup-threshold", type=int, default=2)
+    ap.add_argument("--group-threshold", type=int, default=8)
+    ap.add_argument("--inspect", type=int, default=0,
+                    help="write montages of the N largest duplicate clusters")
     ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
-    build(args.phash_threshold, args.dry_run)
+    a = ap.parse_args()
+
+    if a.group_threshold < a.dedup_threshold:
+        raise SystemExit("--group-threshold must be >= --dedup-threshold")
+    build(a.dedup_threshold, a.group_threshold, a.dry_run, a.inspect)
 
 
 if __name__ == "__main__":
