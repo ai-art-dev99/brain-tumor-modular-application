@@ -1,0 +1,80 @@
+# =============================================================================
+# brain-tumour-hybrid : Python dependencies
+# =============================================================================
+# NOTE ON torch / torchvision
+# ---------------------------
+# torch and torchvision are deliberately NOT listed here. They are provided by
+# the RunPod base image (runpod/pytorch:<TAG>). Reinstalling them would pull
+# ~3 GB and risk a CUDA mismatch with the driver on the host.
+#
+# Record the exact base image tag in README.md and report it in the paper's
+# "Implementation details" section, together with the output of
+# scripts/capture_run_env.sh.
+#
+# IMPORTANT: the version pins below are a starting point. After the first
+# successful install, run
+#     pip freeze > requirements.lock.txt
+# and commit that file. requirements.lock.txt is the artefact you cite in the
+# manuscript and attach as supplementary material, not this file.
+# =============================================================================
+
+# --- core numerics -----------------------------------------------------------
+numpy>=1.26,<3
+scipy>=1.11
+pandas>=2.1
+
+# --- classical ML (SVM / KNN / RF / MLP + nested CV) --------------------------
+scikit-learn>=1.5
+joblib>=1.3
+
+# --- statistics: McNemar's exact test, bootstrap CIs (reviewer point 8) -------
+statsmodels>=0.14
+
+# --- CNN backbone ------------------------------------------------------------
+# timm replaces the previous torch.hub NVIDIA/DeepLearningExamples call.
+# Rationale: timm exposes num_classes=0 + global_pool='avg', which returns a
+# true 1280-d global-average-pooled feature vector. The old code stripped the
+# classifier head from the NVIDIA model, which ALSO removed the pooling layer
+# and produced a 128,000-d flattened feature map.
+timm>=1.0
+
+# --- image I/O and processing ------------------------------------------------
+# headless build: the container has no display server
+opencv-python-headless>=4.9
+pillow>=10.2
+scikit-image>=0.22
+
+# --- augmentation ------------------------------------------------------------
+# albumentations replaces imgaug. imgaug is effectively unmaintained and pins
+# older numpy versions, which conflicts with current scikit-learn.
+albumentations>=1.4
+
+# --- duplicate / near-duplicate detection (reviewer point 3) ------------------
+imagehash>=4.3
+
+# --- reading Figshare (Cheng) .mat files -------------------------------------
+# These are MATLAB v7.3 files, i.e. HDF5 containers. scipy.io.loadmat CANNOT
+# read them. h5py is required to recover cjdata.PID (patient ID), cjdata.label
+# and cjdata.tumorMask. PID is what makes true patient-level splitting possible
+# (reviewer point 3); tumorMask is what makes quantitative interpretability
+# metrics possible (reviewer point 9).
+h5py>=3.10
+
+# --- interpretability (reviewer point 9) -------------------------------------
+grad-cam>=1.5
+
+# --- plotting ----------------------------------------------------------------
+matplotlib>=3.8
+seaborn>=0.13
+
+# --- config, logging, misc ---------------------------------------------------
+pyyaml>=6.0
+tqdm>=4.66
+rich>=13.7
+
+# --- dataset acquisition -----------------------------------------------------
+kaggle>=1.6
+requests>=2.31
+
+# --- spreadsheet export for tables -------------------------------------------
+openpyxl>=3.1
