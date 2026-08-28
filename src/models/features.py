@@ -55,6 +55,9 @@ Usage
 
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore")
+
 import argparse
 import random
 from pathlib import Path
