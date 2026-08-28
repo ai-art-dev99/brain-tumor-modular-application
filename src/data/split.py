@@ -1,45 +1,37 @@
 #!/usr/bin/env python3
 """
-split.py -- generate nested, group-aware cross-validation splits.
+split.py (v2) -- generate nested cross-validation splits, grouped or
+deliberately ungrouped.
 
-WHY NESTED, AND WHY GROUPED
----------------------------
-Grouped: every image belonging to one patient (or, where no identifier exists,
-one pseudo-patient cluster) must fall entirely on one side of any partition.
-The composite benchmark averages several slices per patient, so an
-image-level split places near-identical views of the same brain in both train
-and test. That is the single largest source of the optimistic accuracies
-reported on this dataset.
+WHY AN UNGROUPED OPTION EXISTS
+------------------------------
+--ignore-groups reproduces the flawed procedure used throughout the published
+literature on this benchmark: a random split at the level of individual images,
+which scatters slices of one patient across train and test. It is generated
+here only so that the identical model, features and metrics can be run on both
+partitions. The difference between the two is the estimate of how much
+published performance on this dataset is attributable to leakage.
 
-Nested: hyperparameters must be chosen without ever consulting the data that
-produces the reported number. The outer loop estimates performance; the inner
-loop tunes. Selecting a checkpoint or a value of C on the test fold and then
-reporting accuracy on that same fold is model selection on the test set.
+When --ignore-groups is set, the verification step does not abort on a group
+that spans folds. Instead it MEASURES the contamination -- how many patients
+and groups are split across the boundary, and how many test images have a
+same-patient sibling in training -- because those counts are themselves a
+result to report.
 
-CONFIGURATIONS
---------------
-  main          4-class, the full curated dataset. Groups mix true patient IDs
-                (Figshare-derived images) with pseudo-patient clusters
-                (BR35H). Comparable in scope to published work.
-
-  figshare_only 3-class, restricted to images carrying a genuine patient ID.
-                No 'no tumour' class exists in Figshare. This is the reference
-                condition: the only partition where grouping rests entirely on
-                metadata rather than inference.
-
-  source_probe  Not a split. Quantifies how many SARTAJ images survive as
-                non-duplicates of Figshare, i.e. whether an independent
-                source-based test set is constructible at all.
-
-OUTPUT
-------
-  splits_<config>_outer.csv   path, label, group_id, outer_fold
-  splits_<config>_inner.csv   outer_fold, path, inner_fold
-  split_report_<config>.txt
+CHANGES FROM v1
+---------------
+- --ignore-groups and --tag added, so a flawed baseline can be written
+  alongside the grouped split without overwriting it.
+- Verification is strict for grouped splits (violations abort) and diagnostic
+  for ungrouped ones (violations are counted and reported).
+- The leakage summary now reports the fraction of test images that have a
+  same-patient sibling in the training portion, which is the quantity that
+  actually drives the inflation.
 
 Usage
 -----
     python split.py --config main --outer 5 --inner 3 --seed 42
+    python split.py --config main --ignore-groups --tag main_imagelevel
     python split.py --config figshare_only
     python split.py --config source_probe
     python split.py --verify main
@@ -53,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
 MANIFEST = Path("/workspace/data/manifest")
 SPLITS = MANIFEST / "splits"
@@ -73,113 +65,148 @@ def select(df: pd.DataFrame, config: str) -> pd.DataFrame:
     if config == "main":
         return df.reset_index(drop=True)
     if config == "figshare_only":
-        # Restrict to images with a metadata-backed identifier. Note this is
-        # not the same as source == 'figshare': duplicate-cluster propagation
-        # gave some SARTAJ images a genuine patient ID, and those are
-        # legitimately included here.
-        sub = df[df.patient_id != ""].copy()
-        sub = sub[sub.label != "notumor"]
+        # Images carrying a metadata-backed identifier. Not identical to
+        # source == 'figshare': duplicate-cluster propagation gave some SARTAJ
+        # images a genuine patient ID, and those belong here too.
+        sub = df[(df.patient_id != "") & (df.label != "notumor")]
         return sub.reset_index(drop=True)
     sys.exit(f"unknown config: {config}")
 
 
 # =============================================================================
 
-def make_splits(df: pd.DataFrame, n_outer: int, n_inner: int,
-                seed: int, config: str) -> None:
+def make_splits(df: pd.DataFrame, n_outer: int, n_inner: int, seed: int,
+                name: str, ignore_groups: bool) -> None:
     SPLITS.mkdir(parents=True, exist_ok=True)
 
     y = df.label.to_numpy()
     g = df.group_id.to_numpy()
 
-    n_groups_min = df.groupby("label").group_id.nunique().min()
-    if n_groups_min < n_outer:
-        sys.exit(f"ERROR: the smallest class has only {n_groups_min} groups, "
-                 f"fewer than --outer {n_outer}. Reduce the number of folds.")
+    if ignore_groups:
+        print("  !! --ignore-groups: patient structure is discarded ON PURPOSE.")
+        print("     This partition is the flawed baseline, not a usable split.")
+        outer_iter = StratifiedKFold(
+            n_splits=n_outer, shuffle=True, random_state=seed).split(df, y)
+    else:
+        smallest = df.groupby("label").group_id.nunique().min()
+        if smallest < n_outer:
+            sys.exit(f"ERROR: smallest class has {smallest} groups < "
+                     f"--outer {n_outer}.")
+        print(f"    smallest class has {smallest} groups")
+        outer_iter = StratifiedGroupKFold(
+            n_splits=n_outer, shuffle=True, random_state=seed).split(df, y, g)
 
-    print(f"==> {config}: {len(df)} images, {df.group_id.nunique()} groups, "
-          f"{df.label.nunique()} classes")
-    print(f"    smallest class has {n_groups_min} groups")
-
-    # -- outer loop -----------------------------------------------------------
-    outer = StratifiedGroupKFold(n_splits=n_outer, shuffle=True, random_state=seed)
+    df = df.copy()
     df["outer_fold"] = -1
-    for k, (_, test_idx) in enumerate(outer.split(df, y, g)):
-        df.loc[df.index[test_idx], "outer_fold"] = k
-
+    for k, (_, te) in enumerate(outer_iter):
+        df.loc[df.index[te], "outer_fold"] = k
     assert (df.outer_fold >= 0).all(), "some rows were never assigned a fold"
 
     # -- inner loops ----------------------------------------------------------
     inner_rows = []
     for k in range(n_outer):
         tr = df[df.outer_fold != k].reset_index(drop=True)
-        smallest = tr.groupby("label").group_id.nunique().min()
-        if smallest < n_inner:
-            sys.exit(f"ERROR: outer fold {k} training portion has a class with "
-                     f"only {smallest} groups, fewer than --inner {n_inner}.")
-        # A different seed per outer fold, derived deterministically, so the
-        # inner partitions are not identical copies across outer folds.
-        inner = StratifiedGroupKFold(n_splits=n_inner, shuffle=True,
-                                     random_state=seed + 1000 + k)
-        for m, (_, val_idx) in enumerate(inner.split(
-                tr, tr.label.to_numpy(), tr.group_id.to_numpy())):
-            for p in tr.path.to_numpy()[val_idx]:
+        # A distinct but deterministic seed per outer fold, so inner partitions
+        # are not identical copies across the outer loop.
+        rs = seed + 1000 + k
+        if ignore_groups:
+            it = StratifiedKFold(n_splits=n_inner, shuffle=True,
+                                 random_state=rs).split(tr, tr.label)
+        else:
+            s = tr.groupby("label").group_id.nunique().min()
+            if s < n_inner:
+                sys.exit(f"ERROR: outer fold {k} training portion has a class "
+                         f"with {s} groups < --inner {n_inner}.")
+            it = StratifiedGroupKFold(n_splits=n_inner, shuffle=True,
+                                      random_state=rs).split(
+                tr, tr.label, tr.group_id)
+        for m, (_, va) in enumerate(it):
+            for p in tr.path.to_numpy()[va]:
                 inner_rows.append({"outer_fold": k, "path": p, "inner_fold": m})
 
     inner_df = pd.DataFrame(inner_rows)
+    report = verify(df, inner_df, n_outer, name, strict=not ignore_groups)
 
-    # -- verification ---------------------------------------------------------
-    report = verify(df, inner_df, n_outer, config)
-
-    out_o = SPLITS / f"splits_{config}_outer.csv"
-    out_i = SPLITS / f"splits_{config}_inner.csv"
+    out_o = SPLITS / f"splits_{name}_outer.csv"
     df[["path", "label", "group_id", "patient_id", "source",
         "mask_path", "outer_fold"]].to_csv(out_o, index=False)
-    inner_df.to_csv(out_i, index=False)
-    (SPLITS / f"split_report_{config}.txt").write_text(report)
-
+    inner_df.to_csv(SPLITS / f"splits_{name}_inner.csv", index=False)
+    (SPLITS / f"split_report_{name}.txt").write_text(report)
     print(f"\n    wrote {out_o}")
-    print(f"    wrote {out_i}")
+    print(f"    wrote {SPLITS / f'splits_{name}_inner.csv'}")
 
 
-def verify(df: pd.DataFrame, inner_df: pd.DataFrame,
-           n_outer: int, config: str) -> str:
+def verify(df: pd.DataFrame, inner_df: pd.DataFrame, n_outer: int,
+           name: str, strict: bool) -> str:
     """
-    Assert the properties the whole exercise depends on. A split that silently
-    violates them reproduces exactly the flaw being corrected, so these are
-    hard failures rather than warnings.
+    Strict mode: any violation aborts, because a grouped split that silently
+    leaks reproduces the exact flaw being corrected.
+    Diagnostic mode: violations are counted and reported, because for the
+    ungrouped baseline they are the measurement of interest.
     """
-    lines: list[str] = [f"Split verification: {config}", "=" * 60, ""]
+    lines = [f"Split verification: {name}",
+             f"mode: {'strict (grouped)' if strict else 'diagnostic (ungrouped)'}",
+             "=" * 60, ""]
 
-    # 1. no group spans two outer folds
+    # -- group containment ----------------------------------------------------
     spread = df.groupby("group_id").outer_fold.nunique()
-    bad = spread[spread > 1]
-    if len(bad):
-        sys.exit(f"FATAL: {len(bad)} groups span more than one outer fold.")
-    lines.append(f"[ok] no group spans two outer folds "
-                 f"({df.group_id.nunique()} groups)")
+    bad_groups = spread[spread > 1]
+    if strict:
+        if len(bad_groups):
+            sys.exit(f"FATAL: {len(bad_groups)} groups span >1 outer fold.")
+        lines.append(f"[ok] no group spans two outer folds "
+                     f"({df.group_id.nunique()} groups)")
+    else:
+        pct = 100 * len(bad_groups) / df.group_id.nunique()
+        lines.append(f"[leak] {len(bad_groups)} of {df.group_id.nunique()} "
+                     f"groups span >1 outer fold ({pct:.1f}%)")
 
-    # 2. no real patient spans two outer folds
+    # -- patient containment --------------------------------------------------
     withpid = df[df.patient_id != ""]
     if len(withpid):
-        pspread = withpid.groupby("patient_id").outer_fold.nunique()
-        pbad = pspread[pspread > 1]
-        if len(pbad):
-            sys.exit(f"FATAL: {len(pbad)} patients span more than one fold.")
-        lines.append(f"[ok] no patient spans two outer folds "
-                     f"({withpid.patient_id.nunique()} patients)")
+        ps = withpid.groupby("patient_id").outer_fold.nunique()
+        bad_p = ps[ps > 1]
+        if strict:
+            if len(bad_p):
+                sys.exit(f"FATAL: {len(bad_p)} patients span >1 outer fold.")
+            lines.append(f"[ok] no patient spans two outer folds "
+                         f"({withpid.patient_id.nunique()} patients)")
+        else:
+            pct = 100 * len(bad_p) / withpid.patient_id.nunique()
+            lines.append(f"[leak] {len(bad_p)} of "
+                         f"{withpid.patient_id.nunique()} patients span >1 "
+                         f"outer fold ({pct:.1f}%)")
 
-    # 3. inner validation folds never touch the outer test fold
+    # -- the quantity that actually drives inflation --------------------------
+    # For each fold, how many test images belong to a group that also appears
+    # in that fold's training portion? Those images have a near-identical
+    # sibling the model has already memorised.
+    contaminated = []
     for k in range(n_outer):
-        test_paths = set(df[df.outer_fold == k].path)
-        inner_paths = set(inner_df[inner_df.outer_fold == k].path)
-        overlap = test_paths & inner_paths
+        te = df[df.outer_fold == k]
+        tr_groups = set(df[df.outer_fold != k].group_id)
+        n_bad = int(te.group_id.isin(tr_groups).sum())
+        contaminated.append((k, len(te), n_bad, 100 * n_bad / max(len(te), 1)))
+    tot_bad = sum(c[2] for c in contaminated)
+    lines += ["", "Test images with a same-group sibling in training:"]
+    for k, n, nb, pc in contaminated:
+        lines.append(f"  fold {k}: {nb:5d} / {n:5d}  ({pc:5.1f}%)")
+    lines.append(f"  overall: {tot_bad} / {len(df)} "
+                 f"({100 * tot_bad / len(df):.1f}%)")
+    if not strict and tot_bad:
+        lines.append("  -> this is the contamination the grouped split removes.")
+
+    # -- inner loops ----------------------------------------------------------
+    for k in range(n_outer):
+        overlap = (set(df[df.outer_fold == k].path)
+                   & set(inner_df[inner_df.outer_fold == k].path))
         if overlap:
             sys.exit(f"FATAL: outer fold {k} test data appears in its own "
-                     f"inner loop ({len(overlap)} images).")
+                     f"inner loop ({len(overlap)} images). This is a bug, not "
+                     f"a property of the split mode.")
+    lines.append("")
     lines.append("[ok] inner loops never see their outer test fold")
 
-    # 4. every class present in every fold
     ct = pd.crosstab(df.outer_fold, df.label)
     if (ct == 0).any().any():
         lines.append("[WARN] a class is absent from at least one fold")
@@ -187,22 +214,16 @@ def verify(df: pd.DataFrame, inner_df: pd.DataFrame,
         lines.append("[ok] every class appears in every fold")
 
     lines += ["", "Images per outer fold and class:", ct.to_string(), ""]
-
     gct = df.groupby(["outer_fold", "label"]).group_id.nunique().unstack()
     lines += ["Independent groups per outer fold and class:", gct.to_string(), ""]
-
-    # The ratio of images to groups is the quantity that an image-level split
-    # would have silently inflated: it is the average number of correlated
-    # samples per independent unit.
-    ratio = (ct / gct).round(1)
     lines += ["Images per group (correlated samples per independent unit):",
-              ratio.to_string(), ""]
-
-    src = pd.crosstab(df.outer_fold, df.source)
-    lines += ["Source composition per fold:", src.to_string(), ""]
-
-    n_mask = df[df.mask_path != ""].groupby("outer_fold").size()
-    lines += ["Images with a tumour mask per fold:", n_mask.to_string(), ""]
+              (ct / gct).round(1).to_string(), ""]
+    lines += ["Source composition per fold:",
+              pd.crosstab(df.outer_fold, df.source).to_string(), ""]
+    if (df.mask_path != "").any():
+        lines += ["Images with a tumour mask per fold:",
+                  df[df.mask_path != ""].groupby("outer_fold").size().to_string(),
+                  ""]
 
     text = "\n".join(lines)
     print()
@@ -213,57 +234,38 @@ def verify(df: pd.DataFrame, inner_df: pd.DataFrame,
 # =============================================================================
 
 def source_probe(df: pd.DataFrame) -> None:
-    """
-    How much genuinely independent SARTAJ data survives?
-
-    Representative selection prefers Figshare, so a surviving SARTAJ row is by
-    construction an image that was NOT a near-duplicate of any Figshare slice.
-    Counting them measures whether a source-based held-out test set can be
-    built at all.
-    """
+    """How much genuinely independent SARTAJ data survives deduplication?"""
     print("=" * 70)
     print("Source-independence probe")
     print("=" * 70)
-
     surv = df[df.source == "sartaj"]
     print(f"\n  SARTAJ images surviving deduplication: {len(surv)}")
     if len(surv):
         print(surv.label.value_counts().to_string())
         print(f"  independent groups: {surv.group_id.nunique()}")
-        # Some survivors inherited a Figshare patient ID through cluster
-        # propagation; those are not independent of the training data either.
         indep = surv[surv.patient_id == ""]
-        print(f"\n  of which carry NO Figshare patient link: {len(indep)}")
-        if len(indep):
-            print(indep.label.value_counts().to_string())
-
+        print(f"\n  with no Figshare patient link: {len(indep)}")
     print()
-    print("  Assessment:")
-    n = len(surv)
-    classes = surv.label.nunique() if n else 0
-    if n < 300 or classes < 3:
-        print("    A source-based held-out test set is NOT constructible from")
-        print("    these repositories. SARTAJ is largely a redistribution of the")
-        print("    Figshare collection, and BR35H contributes only the")
-        print("    'no tumour' class. Genuine external validation requires a")
-        print("    dataset outside this benchmark. Report this as a limitation")
-        print("    rather than presenting an internal split as external.")
-    else:
-        print(f"    {n} images across {classes} classes remain. A source-based")
-        print("    test set is feasible, though it will be class-incomplete.")
+    if len(surv) < 300 or surv.label.nunique() < 3:
+        print("  A source-based held-out test set is NOT constructible here.")
+        print("  SARTAJ is largely a redistribution of Figshare, and BR35H")
+        print("  contributes only the 'no tumour' class. Genuine external")
+        print("  validation requires a dataset outside this benchmark.")
 
 
-def verify_only(config: str) -> None:
-    o = SPLITS / f"splits_{config}_outer.csv"
-    i = SPLITS / f"splits_{config}_inner.csv"
+def verify_only(name: str) -> None:
+    o = SPLITS / f"splits_{name}_outer.csv"
     if not o.exists():
         sys.exit(f"{o} not found")
     df = pd.read_csv(o)
     df["patient_id"] = df.patient_id.fillna("")
     df["mask_path"] = df.mask_path.fillna("")
+    i = SPLITS / f"splits_{name}_inner.csv"
     inner = pd.read_csv(i) if i.exists() else pd.DataFrame(
         columns=["outer_fold", "path", "inner_fold"])
-    verify(df, inner, df.outer_fold.nunique(), config)
+    # Re-verification is always diagnostic: report what is there rather than
+    # aborting on a file that was generated deliberately.
+    verify(df, inner, df.outer_fold.nunique(), name, strict=False)
 
 
 def main() -> None:
@@ -271,11 +273,14 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", choices=["main", "figshare_only", "source_probe"],
                     default="main")
+    ap.add_argument("--ignore-groups", action="store_true",
+                    help="image-level split; generates the flawed baseline")
+    ap.add_argument("--tag", default=None,
+                    help="output name (defaults to --config)")
     ap.add_argument("--outer", type=int, default=5)
     ap.add_argument("--inner", type=int, default=3)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--verify", metavar="CONFIG",
-                    help="re-verify an existing split instead of generating one")
+    ap.add_argument("--verify", metavar="NAME")
     a = ap.parse_args()
 
     if a.verify:
@@ -287,7 +292,15 @@ def main() -> None:
         source_probe(df)
         return
 
-    make_splits(select(df, a.config), a.outer, a.inner, a.seed, a.config)
+    name = a.tag or a.config
+    if a.ignore_groups and name == a.config:
+        sys.exit("Refusing to overwrite the grouped split. Pass --tag, e.g. "
+                 f"--tag {a.config}_imagelevel")
+
+    sub = select(df, a.config)
+    print(f"==> {name}: {len(sub)} images, {sub.group_id.nunique()} groups, "
+          f"{sub.label.nunique()} classes")
+    make_splits(sub, a.outer, a.inner, a.seed, name, a.ignore_groups)
 
 
 if __name__ == "__main__":
