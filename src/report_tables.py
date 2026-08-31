@@ -109,15 +109,25 @@ def table1_sources() -> pd.DataFrame:
     ds["patient_id"] = ds.patient_id.fillna("")
     files = pd.read_csv(MANIFEST / "files_index.csv")
 
+    # files_index.csv covers the loose JPEG repositories only; the Figshare
+    # slices are indexed separately because they are read from .mat archives.
+    # Without this the Figshare raw count came out blank.
+    fig = pd.read_csv(MANIFEST / "figshare_index.csv")
+
     rows = []
     for src, g in ds.groupby("source"):
         meta = SOURCE_META.get(src, {})
-        raw = files[files.source == src]
-        dims = (raw.width.astype(str) + "x" + raw.height.astype(str)).nunique() \
-            if len(raw) else np.nan
+        if src == "figshare":
+            n_raw = len(fig)
+            dims = (fig.width.astype(str) + "x" + fig.height.astype(str)).nunique()
+        else:
+            raw = files[files.source == src]
+            n_raw = len(raw) if len(raw) else np.nan
+            dims = ((raw.width.astype(str) + "x" + raw.height.astype(str)).nunique()
+                    if len(raw) else np.nan)
         rows.append({
             "source": src,
-            "images_raw": int(len(raw)) if len(raw) else np.nan,
+            "images_raw": int(n_raw) if n_raw == n_raw else np.nan,
             "images_after_dedup": int(len(g)),
             "distinct_dimensions_raw": dims,
             "patients": (int(g.patient_id[g.patient_id != ""].nunique())
@@ -207,11 +217,17 @@ def table4_main(runs: list[str]) -> pd.DataFrame:
         m = _load(r)
         if not m:
             continue
+        # Runs produced before train_cnn recorded split_mode wrote "grouped"
+        # unconditionally. The split file's name is authoritative, so derive
+        # both fields from the config rather than trusting the stored value.
+        cfg = m["config"]
+        split = "image" if "imagelevel" in cfg else m.get("split_mode", "grouped")
+        base = m.get("base_config") or cfg.replace("_imagelevel", "")
         for name, v in m["models"].items():
             pt, ci = v["point"], v.get("ci95", {})
             rows.append({
-                "run": m["run_id"], "config": m["config"],
-                "split": m.get("split_mode", "grouped"),
+                "run": m["run_id"], "config": cfg, "base_config": base,
+                "split": split,
                 "unit": m.get("bootstrap_unit", "group"),
                 "model": name,
                 "n_images": m["n_images"], "n_units": m["n_groups"],
@@ -230,14 +246,24 @@ def table4_main(runs: list[str]) -> pd.DataFrame:
 
 
 def table5_leakage(main_df: pd.DataFrame) -> pd.DataFrame:
-    piv = main_df.pivot_table(index="model", columns="split", values="accuracy")
+    """
+    Grouped against image-level, paired WITHIN a base configuration.
+
+    Averaging across configurations would pool `main` with `figshare_only`,
+    which are different populations with different class counts, and produce a
+    number that describes neither.
+    """
+    piv = main_df.pivot_table(index=["base_config", "model"], columns="split",
+                              values="accuracy", aggfunc="first")
     if not {"grouped", "image"} <= set(piv.columns):
         return pd.DataFrame()
     piv = piv.rename(columns={"grouped": "leakage_controlled",
                               "image": "naive_image_level"})
     piv["apparent_inflation_pp"] = (
         100 * (piv.naive_image_level - piv.leakage_controlled)).round(2)
-    return piv.reset_index()
+    return (piv.dropna(subset=["leakage_controlled", "naive_image_level"])
+               .sort_values("apparent_inflation_pp", ascending=False)
+               .reset_index())
 
 
 def supp_perclass(runs: list[str]) -> pd.DataFrame:
@@ -346,9 +372,9 @@ def main() -> None:
     t4 = table4_main(a.runs)
     t4.to_csv(OUT / "table4_main_results.csv", index=False)
     print("== Table 4: main results")
-    print(t4[["run", "split", "unit", "model", "accuracy", "acc_lo", "acc_hi",
-              "balanced_accuracy", "macro_f1", "macro_auc", "ece"]]
-          .round(4).to_string(index=False) + "\n")
+    print(t4[["run", "base_config", "split", "unit", "model", "accuracy",
+              "acc_lo", "acc_hi", "balanced_accuracy", "macro_f1",
+              "macro_auc", "ece"]].round(4).to_string(index=False) + "\n")
 
     t5 = table5_leakage(t4)
     if len(t5):

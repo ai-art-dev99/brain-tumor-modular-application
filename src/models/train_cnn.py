@@ -324,8 +324,15 @@ def run(args):
         print(f"    {a} vs {b}: {d:+.4f} [{lo:+.4f}, {hi:+.4f}]  "
               f"McNemar p={res.pvalue:.4f}  bootstrap p={pboot:.4f}")
 
+    # The split mode is a property of the split file this run consumed, not of
+    # this script. Writing "grouped" unconditionally made the image-level
+    # baseline indistinguishable from the grouped runs and left the leakage
+    # table empty. base_config lets the two be paired for that comparison.
+    image_level = "imagelevel" in args.config
     payload = {
-        "run_id": run_id, "config": args.config, "split_mode": "grouped",
+        "run_id": run_id, "config": args.config,
+        "base_config": args.config.replace("_imagelevel", ""),
+        "split_mode": "image" if image_level else "grouped",
         "backbone": "efficientnet_b0 (timm, ImageNet init, fully fine-tuned)",
         "input_size": list(cfg["input_size"]), "feature_dim": feat_dim,
         "optimiser": "AdamW", "lr": args.lr, "weight_decay": args.weight_decay,

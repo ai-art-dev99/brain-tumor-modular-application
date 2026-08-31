@@ -154,7 +154,7 @@ def probe(X, y_src, folds, seed):
 
 
 def conclusions(r: dict, variant: str, crop: bool, df: pd.DataFrame,
-                class_fixed: str | None) -> list[str]:
+                class_fixed: str | None, restricted: bool = False) -> list[str]:
     """
     What follows from THIS run. Everything below is conditioned on the data
     actually present, not on the dataset as a whole.
@@ -182,8 +182,14 @@ def conclusions(r: dict, variant: str, crop: bool, df: pd.DataFrame,
                 f"removed by design. A high value here cannot be\n  explained by "
                 f"the probe reading tumour type.")
         elif single:
+            # Restricting to a pair of repositories can make a class look
+            # single-source when it is not in the full dataset -- meningioma
+            # and pituitary both draw on Figshare and SARTAJ. Say which is
+            # meant.
+            scope = (" within this restricted subset" if restricted
+                     else " in the full dataset")
             lines.append(
-                f"Classes drawn from a single repository in this run: "
+                f"Classes drawn from a single repository{scope}: "
                 f"{', '.join(single)}. For those\n  classes the label is "
                 f"recoverable from source identity alone, so their per-class\n  "
                 f"figures cannot be read as diagnostic performance without "
@@ -271,7 +277,9 @@ def main() -> None:
               f"(n={int(r['report'][l]['support'])})")
 
     print("\n  What follows from this run:")
-    for line in conclusions(r, a.variant, a.crop, df, a.class_conditional):
+    restricted = bool(a.pair or a.class_conditional)
+    for line in conclusions(r, a.variant, a.crop, df, a.class_conditional,
+                            restricted):
         print(f"  - {line}")
 
     name = (f"{a.config}_{a.variant}{'_crop' if a.crop else ''}"
