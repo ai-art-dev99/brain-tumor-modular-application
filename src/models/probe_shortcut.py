@@ -1,55 +1,42 @@
 #!/usr/bin/env python3
 """
-probe_shortcut.py -- does the model separate repositories by acquisition
-signature, or merely by tumour phenotype?
+probe_shortcut.py (v2) -- is repository identity recoverable from
+non-diagnostic image content?
 
-THE OBJECTION THIS ANSWERS
---------------------------
-A probe that recovers the source repository at 98.7% accuracy is suggestive
-but not conclusive, because diagnosis and source are confounded in this
-benchmark: glioma comes only from Figshare, 'no tumour' only from BR35H. A
-reviewer can reasonably reply that the probe is simply recognising the
-pathology, which happens to be source-specific.
+CHANGES FROM v1
+---------------
+1. The interpretation text was written for the whole-dataset run and printed
+   verbatim in every mode. After a meningioma-only run it claimed that
+   "'no tumour' is drawn exclusively from BR35H", which is true of the dataset
+   but irrelevant to a run containing neither BR35H nor the no-tumour class.
+   Conclusions are now derived from what the run actually contains.
 
-Three variants separate the two explanations.
+2. "no anatomy and therefore no pathology is present" overstated the masking.
+   The region outside an Otsu head mask still carries the skull contour, the
+   field of view, cropping and padding decisions, resampling and JPEG
+   artefacts. What the probe establishes is source-specific NON-PATHOLOGICAL
+   signal, which is the claim that matters and is defensible; scanner
+   acquisition alone is not separable from storage pipeline here.
 
-  full        whole image. The original probe. Confounded.
+3. Adjectival verdicts ("moderate signal") are gone. The script reports
+   balanced accuracy against the chance level and the majority baseline, plus
+   per-source recall, and states what does and does not follow. The reader
+   draws the line.
 
-  background  the head is masked out and only what surrounds it remains:
-              framing, padding, noise floor, compression artefacts, field of
-              view. No anatomy and therefore no pathology is present. If the
-              repository is still recoverable here, the signature is in the
-              acquisition and storage pipeline, and the confound explanation
-              fails. This is the decisive test.
-
-  brain       the complement: background masked out, optionally cropped to the
-              head bounding box and rescaled, which also removes framing and
-              scale cues. Performance here is what a model would have to rely
-              on if the shortcut were unavailable.
-
-CLASS-CONDITIONAL PROBE
------------------------
---class-conditional holds the diagnosis fixed and asks whether the source is
-still recoverable. Only meningioma supports this: 702 Figshare against 133
-SARTAJ images survive deduplication. Pituitary has just 35 SARTAJ survivors,
-too few to interpret, and BR35H shares no class with the others at all. The
-background probe is therefore the stronger evidence; this one corroborates.
-
-READING THE NUMBERS
--------------------
-Sources are heavily imbalanced (3,038 Figshare against 607 BR35H and 168
-SARTAJ), so plain accuracy has a high floor. Balanced accuracy and per-source
-recall are reported alongside, and a majority-class baseline is printed for
-reference. Splits are the same group-disjoint folds used for diagnosis, so no
-patient contributes to both sides.
+VARIANTS
+--------
+  full        whole image; source and diagnosis are confounded.
+  background  everything outside the estimated head mask. No brain tissue, so
+              tumour phenotype cannot explain a positive result.
+  brain       inside the mask only; --crop additionally crops to the head
+              bounding box and rescales, removing framing and field-of-view
+              cues along with the background.
 
 Usage
 -----
-    python probe_shortcut.py --variant full
-    python probe_shortcut.py --variant background
-    python probe_shortcut.py --variant brain --crop
     python probe_shortcut.py --variant background --pair figshare br35h
     python probe_shortcut.py --variant background --class-conditional meningioma
+    python probe_shortcut.py --variant brain --crop
 """
 
 from __future__ import annotations
@@ -82,7 +69,6 @@ OUT = Path("/workspace/outputs/probes")
 
 
 def head_mask(grey: np.ndarray) -> np.ndarray:
-    """Otsu threshold, holes filled, largest connected component kept."""
     try:
         t = threshold_otsu(grey)
     except Exception:
@@ -92,78 +78,70 @@ def head_mask(grey: np.ndarray) -> np.ndarray:
     if n > 1:
         sizes = ndimage.sum(m, lab, range(1, n + 1))
         m = lab == (int(np.argmax(sizes)) + 1)
-    if m.sum() < 0.02 * m.size:      # degenerate threshold
+    if m.sum() < 0.02 * m.size:
         m = np.ones_like(m, dtype=bool)
     return m.astype(bool)
 
 
 class MaskedImages(Dataset):
-    """Applies the head mask before the network transform."""
-
     def __init__(self, paths, variant, crop, size, mean, std):
-        self.paths, self.variant, self.crop = list(paths), variant, crop
-        self.size = size
-        self.norm = transforms.Compose([
-            transforms.ToTensor(), transforms.Normalize(mean, std)])
+        self.paths, self.variant, self.crop, self.size = list(paths), variant, crop, size
+        self.norm = transforms.Compose([transforms.ToTensor(),
+                                        transforms.Normalize(mean, std)])
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, i):
-        img = Image.open(self.paths[i]).convert("L").resize(
-            (self.size, self.size))
-        a = np.asarray(img, dtype=np.uint8)
-
+        a = np.asarray(Image.open(self.paths[i]).convert("L")
+                       .resize((self.size, self.size)), dtype=np.uint8)
         if self.variant != "full":
             m = head_mask(a.astype(np.float32))
             if self.variant == "brain":
                 a = np.where(m, a, 0).astype(np.uint8)
                 if self.crop and m.any():
-                    # Cropping to the head bounding box and rescaling removes
-                    # framing and field-of-view cues as well as the background
-                    # itself, which the plain mask leaves intact.
                     ys, xs = np.where(m)
                     a = np.asarray(
                         Image.fromarray(a[ys.min():ys.max() + 1,
                                           xs.min():xs.max() + 1])
                         .resize((self.size, self.size)), dtype=np.uint8)
-            else:                                   # background
+            else:
                 a = np.where(m, 0, a).astype(np.uint8)
-
-        rgb = np.repeat(a[:, :, None], 3, axis=2)
-        return self.norm(Image.fromarray(rgb)), i
+        return self.norm(Image.fromarray(np.repeat(a[:, :, None], 3, 2))), i
 
 
 @torch.no_grad()
 def features_for(paths, variant, crop, batch_size, workers):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = timm.create_model("efficientnet_b0", pretrained=True,
-                              num_classes=0, global_pool="avg").eval().to(device)
+    model = timm.create_model("efficientnet_b0", pretrained=True, num_classes=0,
+                              global_pool="avg").eval().to(device)
     cfg = timm.data.resolve_model_data_config(model)
     ds = MaskedImages(paths, variant, crop, cfg["input_size"][1],
                       cfg["mean"], cfg["std"])
     dl = DataLoader(ds, batch_size=batch_size, shuffle=False,
                     num_workers=workers, pin_memory=True)
     out = np.empty((len(ds), model.num_features), dtype=np.float32)
-    for xb, idx in tqdm(dl, unit="batch", desc=f"{variant}{'+crop' if crop else ''}"):
+    tag = f"{variant}{'+crop' if crop else ''}"
+    for xb, idx in tqdm(dl, unit="batch", desc=tag):
         out[idx.numpy()] = model(xb.to(device)).float().cpu().numpy()
     del model
     torch.cuda.empty_cache()
     return out
 
 
-def probe(X, y_src, folds, seed) -> dict:
-    """Grouped out-of-fold source classification, using the diagnostic splits."""
+def probe(X, y_src, folds, seed):
+    """Out-of-fold source classification on the diagnostic splits, so no
+    patient contributes to both sides."""
     preds = np.empty(len(y_src), dtype=object)
     for k in sorted(set(folds)):
         tr, te = folds != k, folds == k
         if len(set(y_src[tr])) < 2:
             preds[te] = y_src[tr][0]
             continue
-        clf = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(max_iter=3000, class_weight="balanced",
-                               random_state=seed))
+        clf = make_pipeline(StandardScaler(),
+                            LogisticRegression(max_iter=3000,
+                                               class_weight="balanced",
+                                               random_state=seed))
         clf.fit(X[tr], y_src[tr])
         preds[te] = clf.predict(X[te])
     labs = sorted(set(y_src))
@@ -175,19 +153,82 @@ def probe(X, y_src, folds, seed) -> dict:
                                             zero_division=0, output_dict=True)}
 
 
+def conclusions(r: dict, variant: str, crop: bool, df: pd.DataFrame,
+                class_fixed: str | None) -> list[str]:
+    """
+    What follows from THIS run. Everything below is conditioned on the data
+    actually present, not on the dataset as a whole.
+    """
+    ba = r["balanced_accuracy"]
+    chance = 1.0 / len(r["labels"])
+    lines = [f"balanced accuracy {ba:.4f} against a chance level of {chance:.4f}"]
+
+    single_source = df.groupby("label").source.nunique().eq(1)
+    single = list(single_source[single_source].index)
+
+    if variant == "background":
+        lines.append(
+            "The probe saw only the region outside an Otsu head-mask estimate. "
+            "That region\n  excludes brain tissue, so tumour phenotype cannot "
+            "account for the result. It does\n  retain the skull contour, field "
+            "of view, cropping, padding, resampling and\n  compression, so what "
+            "is demonstrated is source-specific NON-PATHOLOGICAL signal --\n  "
+            "not scanner acquisition in isolation, which these repositories do "
+            "not let us separate.")
+        if class_fixed:
+            lines.append(
+                f"The diagnostic class is held constant at '{class_fixed}', so "
+                f"the confound in which\n  source and pathology co-vary is "
+                f"removed by design. A high value here cannot be\n  explained by "
+                f"the probe reading tumour type.")
+        elif single:
+            lines.append(
+                f"Classes drawn from a single repository in this run: "
+                f"{', '.join(single)}. For those\n  classes the label is "
+                f"recoverable from source identity alone, so their per-class\n  "
+                f"figures cannot be read as diagnostic performance without "
+                f"qualification.")
+        else:
+            lines.append(
+                "No class in this run comes from a single repository, so source "
+                "identity does not\n  by itself determine any label here.")
+    elif variant == "brain":
+        lines.append(
+            "Background was removed" + (" and the head cropped and rescaled"
+                                        if crop else "") +
+            ", so framing cues are reduced. Signal remaining\n  here is "
+            "ambiguous between anatomy and within-head acquisition differences "
+            "such as\n  sequence, contrast and noise. Read it against the "
+            "background variant: if both are\n  high, masking the background "
+            "does not remove the confound.")
+    else:
+        lines.append(
+            "Whole-image probe: source and diagnosis are confounded in this "
+            "benchmark, so this\n  value alone does not distinguish acquisition "
+            "signature from tumour phenotype. Use\n  the background and "
+            "class-conditional variants for that.")
+
+    worst = min(r["report"][l]["recall"] for l in r["labels"])
+    if worst < 0.80:
+        low = [l for l in r["labels"] if r["report"][l]["recall"] < 0.80]
+        lines.append(
+            f"Recall is below 0.80 for {', '.join(low)}, which pulls the "
+            f"balanced figure down.\n  Where one repository is a "
+            f"re-encoded derivative of another, confusion between the\n  two is "
+            f"expected and is itself evidence of that relationship; report the "
+            f"pairwise\n  comparison alongside the multi-way one.")
+    return lines
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="main")
     ap.add_argument("--variant", choices=["full", "brain", "background"],
                     default="background")
-    ap.add_argument("--crop", action="store_true",
-                    help="brain variant only: crop to head bbox and rescale")
-    ap.add_argument("--pair", nargs=2, default=None,
-                    metavar=("SRC_A", "SRC_B"),
-                    help="restrict to two repositories, e.g. figshare br35h")
-    ap.add_argument("--class-conditional", default=None,
-                    help="hold diagnosis fixed, e.g. meningioma")
+    ap.add_argument("--crop", action="store_true")
+    ap.add_argument("--pair", nargs=2, default=None, metavar=("SRC_A", "SRC_B"))
+    ap.add_argument("--class-conditional", default=None)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
@@ -195,10 +236,9 @@ def main() -> None:
 
     OUT.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(SPLITS / f"splits_{a.config}_outer.csv")
-
     if a.class_conditional:
         df = df[df.label == a.class_conditional]
-        print(f"==> class-conditional on '{a.class_conditional}'")
+        print(f"==> diagnosis held constant: '{a.class_conditional}'")
     if a.pair:
         df = df[df.source.isin(a.pair)]
         print(f"==> restricted to {a.pair[0]} vs {a.pair[1]}")
@@ -209,13 +249,12 @@ def main() -> None:
     print(counts.to_string())
     if len(counts) < 2:
         raise SystemExit("fewer than two sources remain; nothing to probe.")
+    print(f"\n  classes present: {', '.join(sorted(df.label.unique()))}")
+    print(f"  majority-source baseline accuracy: {counts.max() / len(df):.4f}")
+    print(f"  chance balanced accuracy:          {1 / len(counts):.4f}")
     if counts.min() < 30:
-        print(f"\n  WARNING: smallest source has {counts.min()} images. "
-              f"Treat this probe as indicative only;\n  with so few examples "
-              f"the estimate is unstable regardless of what it shows.")
-
-    print(f"\n  majority-class baseline accuracy: {counts.max() / len(df):.4f}")
-    print(f"  chance balanced accuracy:         {1 / len(counts):.4f}")
+        print(f"  WARNING: smallest source has {counts.min()} images; the "
+              f"estimate is unstable\n           regardless of its value.")
 
     X = features_for(df.path, a.variant, a.crop, a.batch_size, a.workers)
     r = probe(X, df.source.to_numpy(), df.outer_fold.to_numpy(), a.seed)
@@ -231,35 +270,22 @@ def main() -> None:
         print(f"    {l:<10} {r['report'][l]['recall']:.4f}  "
               f"(n={int(r['report'][l]['support'])})")
 
-    print()
-    ba = r["balanced_accuracy"]
-    if a.variant == "background":
-        if ba > 0.90:
-            print("  The repository is recoverable from the background alone,")
-            print("  where no anatomy and therefore no pathology is present.")
-            print("  The confound explanation -- that the probe is reading")
-            print("  tumour phenotype -- does not account for this. Because")
-            print("  'no tumour' is drawn exclusively from BR35H, that class")
-            print("  carries an acquisition signature sufficient to identify it")
-            print("  without reference to the brain.")
-        elif ba > 0.70:
-            print("  Moderate signal outside the head. Report the value and")
-            print("  avoid strong claims in either direction.")
-        else:
-            print("  Little signal outside the head: the earlier whole-image")
-            print("  probe was likely reading anatomy, not acquisition. The")
-            print("  shortcut hypothesis is not supported by this test and")
-            print("  should be withdrawn rather than hedged.")
-    elif a.variant == "brain":
-        print("  Compare against the background variant. Signal here is")
-        print("  ambiguous: it may be anatomy, or residual acquisition")
-        print("  differences within the head such as contrast and noise.")
+    print("\n  What follows from this run:")
+    for line in conclusions(r, a.variant, a.crop, df, a.class_conditional):
+        print(f"  - {line}")
 
     name = (f"{a.config}_{a.variant}{'_crop' if a.crop else ''}"
             f"{'_' + a.class_conditional if a.class_conditional else ''}"
             f"{'_' + '-'.join(a.pair) if a.pair else ''}")
-    (OUT / f"{name}.json").write_text(json.dumps(
-        {k: v for k, v in r.items() if k != "pred"}, indent=2))
+    payload = {k: v for k, v in r.items() if k != "pred"}
+    payload.update({"variant": a.variant, "crop": a.crop,
+                    "class_conditional": a.class_conditional,
+                    "pair": a.pair, "n_images": len(df),
+                    "source_counts": counts.to_dict(),
+                    "classes_present": sorted(df.label.unique()),
+                    "majority_baseline": float(counts.max() / len(df)),
+                    "chance_balanced": float(1 / len(counts))})
+    (OUT / f"{name}.json").write_text(json.dumps(payload, indent=2))
     pd.DataFrame({"path": df.path, "source": df.source, "label": df.label,
                   "pred_source": r["pred"]}).to_csv(
         OUT / f"{name}_predictions.csv", index=False)
