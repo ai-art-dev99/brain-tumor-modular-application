@@ -303,7 +303,7 @@ def deferral(args) -> None:
 
         print(f"\n  {mdl}")
         print(f"    {'defer':>6}  {'kept':>6}  {'accuracy':>9}  "
-              f"{'patients kept':>14}")
+              f"{'groups kept':>14}")
         for frac in [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]:
             n_def = int(round(frac * len(y)))
             keep = np.ones(len(y), bool)

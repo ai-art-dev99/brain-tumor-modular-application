@@ -1,47 +1,42 @@
 #!/usr/bin/env python3
 """
-train_eval.py -- nested, group-aware evaluation of the hybrid classifiers.
+train_eval.py (v2) -- nested, group-aware evaluation.
 
-WHAT THIS REPLACES
-------------------
-The original pipeline (a) selected the best CNN checkpoint on the test set,
-(b) evaluated the CNN on the held-out folder but evaluated the hybrid
-classifiers on a random 20% of the *training* folder, so the headline
-"96% vs 95%" compared numbers computed on different data, (c) reported
-tp/(tp+fp+fn) -- the Jaccard index -- under the name "accuracy", and (d) fixed
-SVC(kernel='linear', C=0.025) with no search at all.
+CHANGES FROM v1
+---------------
+1. MLPClassifier(early_stopping=True) removed. scikit-learn carves its own
+   internal validation split at random, which ignores the patient grouping and
+   places sibling slices on both sides of it. The split is inside the training
+   fold so nothing reaches the outer test set, but the stopping point was being
+   chosen against partially memorised data. max_iter is fixed instead.
 
-Here: hyperparameters are chosen in an inner loop that never sees the outer
-test fold; every model is evaluated on the same pooled out-of-fold
-predictions; and metrics are named for what they compute.
+2. SVC no longer uses probability=True. That option fits Platt scaling through
+   an internal 5-fold CV which is likewise not group-aware -- and those are the
+   very probabilities the deferral analysis rests on. Calibration is now done
+   explicitly with CalibratedClassifierCV over the same group-disjoint inner
+   folds used for tuning.
 
-THE LEAKAGE COMPARISON
-----------------------
---split-mode image reruns the identical procedure with a random image-level
-split, ignoring patient groups. The gap between the two is a direct estimate
-of how much of the published performance on this benchmark comes from
-near-duplicate slices of the same patient appearing on both sides of the
-split. Report both numbers side by side.
+3. Confidence intervals now cover every reported metric, not just three.
+   A single bootstrap pass computes all of them, so the cost is unchanged.
 
-CONFIDENCE INTERVALS ARE RESAMPLED OVER GROUPS, NOT IMAGES
-----------------------------------------------------------
-With 15.8 correlated images per glioma patient, resampling images treats
-15.8 views of one brain as 15.8 independent observations and produces
-intervals that are far too narrow. The original manuscript's normal-
-approximation intervals (e.g. 0.9529-0.9631) have exactly this problem.
-Bootstrapping over groups respects the correlation structure.
+4. Calibration quality is reported (multiclass Brier score, expected
+   calibration error), because a deferral claim depends on the scores being
+   meaningful and not merely ordered.
+
+5. Per-fold results are exported. Pooled out-of-fold estimates hide
+   between-fold spread, which on this dataset is large: with ~47 test patients
+   per fold and up to 38 slices each, a handful of difficult patients moves
+   accuracy by several points. A single random split can land anywhere in that
+   range, which is one route by which single-split studies report 98-99%.
 
 Usage
 -----
-    python train_eval.py --config main --models svm knn rf mlp
-    python train_eval.py --config main --split-mode image --tag naive
-    python train_eval.py --compare runs/main_grouped runs/main_naive
+    python train_eval.py --config main --models svm knn rf mlp logreg
+    python train_eval.py --config main --split-mode image --tag main_naive
+    python train_eval.py --compare main_grouped main_naive
 """
 
 from __future__ import annotations
-
-import warnings
-warnings.filterwarnings("ignore")
 
 import argparse
 import json
@@ -51,10 +46,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
-                             classification_report, confusion_matrix, f1_score,
+                             confusion_matrix, f1_score,
                              precision_recall_fscore_support, roc_auc_score)
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
@@ -68,18 +65,20 @@ FEATURES = Path("/workspace/data/features")
 SPLITS = Path("/workspace/data/manifest/splits")
 RUNS = Path("/workspace/outputs/runs")
 
+# Estimators whose native probabilities come from an internal, non-group-aware
+# resampling scheme and must be recalibrated over group-disjoint folds instead.
+NEEDS_CALIBRATION = {"svm"}
+
 
 # =============================================================================
 # Model zoo
 # =============================================================================
-# class_weight='balanced' rather than oversampling: the classes are only mildly
-# imbalanced at image level, and duplicating images inside a group would
-# further inflate the effective weight of the few patients that contribute many
-# slices.
 
 def model_grid(name: str, seed: int):
     if name == "svm":
-        return (SVC(probability=True, class_weight="balanced", random_state=seed),
+        # probability=False: calibration is applied afterwards, group-aware.
+        return (SVC(probability=False, class_weight="balanced",
+                    random_state=seed),
                 {"clf__kernel": ["linear", "rbf"],
                  "clf__C": [0.1, 1, 10, 100],
                  "clf__gamma": ["scale"]})
@@ -94,7 +93,8 @@ def model_grid(name: str, seed: int):
                  "clf__max_depth": [None, 10, 20],
                  "clf__min_samples_leaf": [1, 3]})
     if name == "mlp":
-        return (MLPClassifier(max_iter=600, early_stopping=True,
+        # early_stopping deliberately off: see module docstring.
+        return (MLPClassifier(max_iter=800, early_stopping=False,
                               random_state=seed),
                 {"clf__hidden_layer_sizes": [(256,), (512,), (256, 128)],
                  "clf__alpha": [1e-4, 1e-3, 1e-2]})
@@ -105,88 +105,130 @@ def model_grid(name: str, seed: int):
     raise SystemExit(f"unknown model: {name}")
 
 
+def fit_tuned(name: str, X, y, cv_pairs, seed: int):
+    """
+    Tune on group-disjoint inner folds, then calibrate on the same folds where
+    the estimator's own probability machinery would not respect grouping.
+    Returns (fitted_estimator, best_params).
+    """
+    est, grid = model_grid(name, seed)
+    pipe = Pipeline([("scale", StandardScaler()), ("clf", est)])
+    gs = GridSearchCV(pipe, grid, cv=cv_pairs, scoring="balanced_accuracy",
+                      n_jobs=-1, refit=True)
+    gs.fit(X, y)
+
+    if name in NEEDS_CALIBRATION:
+        cal = CalibratedClassifierCV(clone(gs.best_estimator_),
+                                     method="sigmoid", cv=cv_pairs)
+        cal.fit(X, y)
+        return cal, gs.best_params_
+    return gs.best_estimator_, gs.best_params_
+
+
 # =============================================================================
 # Metrics
 # =============================================================================
 
-def full_metrics(y_true, y_pred, y_prob, labels) -> dict:
-    """Every quantity reviewer point 7 asks for, computed once."""
+def multiclass_brier(y_idx: np.ndarray, P: np.ndarray, k: int) -> float:
+    """Mean squared error between the probability vector and the one-hot truth."""
+    return float(((P - np.eye(k)[y_idx]) ** 2).sum(1).mean())
+
+
+def expected_calibration_error(conf: np.ndarray, correct: np.ndarray,
+                               n_bins: int = 15) -> float:
+    """Weighted mean gap between confidence and accuracy across bins."""
+    edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.sum():
+            ece += m.mean() * abs(correct[m].mean() - conf[m].mean())
+    return float(ece)
+
+
+def metric_bundle(y_true, y_pred, y_prob, labels) -> dict:
+    """Every scalar metric, computed once. Used both for point estimates and
+    inside the bootstrap loop, so the two can never drift apart."""
+    out = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+    }
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, zero_division=0)
     cm = confusion_matrix(y_true, y_pred, labels=labels)
     tp = np.diag(cm).astype(float)
     fn = cm.sum(1) - tp
     fp = cm.sum(0) - tp
     tn = cm.sum() - (tp + fp + fn)
+    spec = np.divide(tn, tn + fp, out=np.zeros_like(tn, dtype=float),
+                     where=(tn + fp) > 0)
 
-    prec, rec, f1, sup = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, zero_division=0)
-
-    out = {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro",
-                                   zero_division=0)),
-        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted",
-                                      zero_division=0)),
-        "confusion_matrix": cm.tolist(),
-        "labels": list(labels),
-        "per_class": {},
-    }
+    out["macro_precision"] = float(prec.mean())
+    out["macro_recall"] = float(rec.mean())
+    out["macro_specificity"] = float(spec.mean())
+    out["macro_f1"] = float(f1_score(y_true, y_pred, average="macro",
+                                     zero_division=0))
+    out["weighted_f1"] = float(f1_score(y_true, y_pred, average="weighted",
+                                        zero_division=0))
     for i, lab in enumerate(labels):
-        out["per_class"][lab] = {
-            "precision": float(prec[i]),
-            "recall_sensitivity": float(rec[i]),
-            # Specificity is per-class one-vs-rest. In a four-class problem it
-            # is bounded near 1 by construction and carries little information;
-            # it is reported because it is asked for, not because it
-            # discriminates between models.
-            "specificity": float(tn[i] / (tn[i] + fp[i])) if (tn[i] + fp[i]) else 0.0,
-            "f1": float(f1[i]),
-            "support": int(sup[i]),
-            "tp": int(tp[i]), "fp": int(fp[i]),
-            "fn": int(fn[i]), "tn": int(tn[i]),
-            # The metric the original manuscript reported under the name
-            # "accuracy". Kept so the old numbers can be reproduced and the
-            # discrepancy explained.
-            "jaccard": float(tp[i] / (tp[i] + fp[i] + fn[i]))
-                       if (tp[i] + fp[i] + fn[i]) else 0.0,
-        }
+        out[f"precision::{lab}"] = float(prec[i])
+        out[f"recall::{lab}"] = float(rec[i])
+        out[f"specificity::{lab}"] = float(spec[i])
+        out[f"f1::{lab}"] = float(f1[i])
 
     if y_prob is not None:
         try:
-            out["roc_auc_ovr_macro"] = float(roc_auc_score(
+            out["roc_auc_macro"] = float(roc_auc_score(
                 y_true, y_prob, multi_class="ovr", average="macro",
                 labels=labels))
-            out["roc_auc_ovr_weighted"] = float(roc_auc_score(
-                y_true, y_prob, multi_class="ovr", average="weighted",
-                labels=labels))
-        except Exception as e:
-            out["roc_auc_error"] = str(e)
+        except Exception:
+            pass
+        idx = np.array([labels.index(v) for v in y_true])
+        for i, lab in enumerate(labels):
+            try:
+                out[f"auc::{lab}"] = float(roc_auc_score(
+                    (idx == i).astype(int), y_prob[:, i]))
+            except Exception:
+                pass
+        out["brier"] = multiclass_brier(idx, y_prob, len(labels))
+        conf = y_prob.max(1)
+        out["ece"] = expected_calibration_error(
+            conf, (np.asarray(y_pred) == np.asarray(y_true)).astype(float))
+        out["mean_confidence"] = float(conf.mean())
     return out
 
 
-def group_bootstrap(y_true, y_pred, groups, fn, n=2000, seed=0, alpha=0.05):
-    """Percentile CI, resampling whole groups so within-patient correlation is
-    preserved."""
+def bootstrap_all(y_true, y_pred, y_prob, groups, labels,
+                  n: int = 2000, seed: int = 0, alpha: float = 0.05) -> dict:
+    """
+    Percentile intervals for every metric, resampling whole groups.
+
+    Resampling images would treat the ~16 correlated slices of one glioma
+    patient as 16 independent observations and return intervals far too
+    narrow -- the defect in the original manuscript's normal-approximation
+    bounds.
+    """
     rng = np.random.default_rng(seed)
     uniq = np.unique(groups)
     idx = {g: np.where(groups == g)[0] for g in uniq}
-    vals = []
+    acc: dict[str, list[float]] = {}
     for _ in range(n):
         take = rng.choice(uniq, size=len(uniq), replace=True)
         sel = np.concatenate([idx[g] for g in take])
         try:
-            vals.append(fn(y_true[sel], y_pred[sel]))
+            b = metric_bundle(y_true[sel], y_pred[sel],
+                              None if y_prob is None else y_prob[sel], labels)
         except Exception:
             continue
-    if not vals:
-        return (float("nan"), float("nan"))
-    lo, hi = np.percentile(vals, [100 * alpha / 2, 100 * (1 - alpha / 2)])
-    return float(lo), float(hi)
+        for k, v in b.items():
+            acc.setdefault(k, []).append(v)
+    return {k: [float(np.percentile(v, 100 * alpha / 2)),
+                float(np.percentile(v, 100 * (1 - alpha / 2)))]
+            for k, v in acc.items() if v}
 
 
 def paired_group_bootstrap(y_true, pred_a, pred_b, groups, fn,
                            n=2000, seed=0, alpha=0.05):
-    """CI for the difference between two models on the same resampled groups."""
     rng = np.random.default_rng(seed)
     uniq = np.unique(groups)
     idx = {g: np.where(groups == g)[0] for g in uniq}
@@ -200,13 +242,17 @@ def paired_group_bootstrap(y_true, pred_a, pred_b, groups, fn,
             continue
     d = np.array(diffs)
     lo, hi = np.percentile(d, [100 * alpha / 2, 100 * (1 - alpha / 2)])
-    # Two-sided bootstrap p-value: how often the difference crosses zero.
     p = 2 * min((d <= 0).mean(), (d >= 0).mean())
     return float(d.mean()), float(lo), float(hi), float(min(p, 1.0))
 
 
+def confusion_frame(y_true, y_pred, labels) -> pd.DataFrame:
+    return pd.DataFrame(confusion_matrix(y_true, y_pred, labels=labels),
+                        index=labels, columns=labels)
+
+
 # =============================================================================
-# Splits
+# Data
 # =============================================================================
 
 def load_data(config: str, split_mode: str, seed: int, n_folds: int):
@@ -214,18 +260,14 @@ def load_data(config: str, split_mode: str, seed: int, n_folds: int):
     df = pd.read_csv(FEATURES / f"{config}_index.csv")
 
     if split_mode == "grouped":
-        inner = pd.read_csv(SPLITS / f"splits_{config}_inner.csv")
-        return X, df, inner
+        return X, df, pd.read_csv(SPLITS / f"splits_{config}_inner.csv")
 
-    # Image-level split: deliberately ignores groups. This is the flawed
-    # procedure being quantified, not an alternative worth using.
     print("  !! image-level split: patient groups are IGNORED by design")
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     df = df.copy()
     df["outer_fold"] = -1
     for k, (_, te) in enumerate(skf.split(df, df.label)):
         df.loc[df.index[te], "outer_fold"] = k
-
     rows = []
     for k in range(n_folds):
         tr = df[df.outer_fold != k]
@@ -236,19 +278,14 @@ def load_data(config: str, split_mode: str, seed: int, n_folds: int):
     return X, df, pd.DataFrame(rows)
 
 
-def inner_cv_for_fold(train_df: pd.DataFrame, inner: pd.DataFrame, k: int):
-    """Turn the precomputed inner assignment into (train_idx, val_idx) pairs."""
+def inner_cv_for_fold(train_df, inner, k):
     sub = inner[inner.outer_fold == k]
     fold_of = dict(zip(sub.path, sub.inner_fold))
     assign = train_df.path.map(fold_of).to_numpy()
     if pd.isna(assign).any():
         raise SystemExit("some training rows have no inner-fold assignment")
-    pairs = []
-    for m in sorted(set(assign)):
-        va = np.where(assign == m)[0]
-        tr = np.where(assign != m)[0]
-        pairs.append((tr, va))
-    return pairs
+    return [(np.where(assign != m)[0], np.where(assign == m)[0])
+            for m in sorted(set(assign))]
 
 
 # =============================================================================
@@ -260,139 +297,148 @@ def run(config, models, split_mode, seed, n_folds, tag, n_boot):
     groups = df.group_id.to_numpy()
     folds = df.outer_fold.to_numpy()
 
+    # Naming matters for interpretation: only the Figshare subset has genuine
+    # patient identifiers. Elsewhere a "group" is a near-duplicate cluster
+    # standing in for a patient.
+    unit = ("patient" if (df.patient_id.fillna("") != "").all() else "group")
+
     run_id = tag or f"{config}_{split_mode}"
     out_dir = RUNS / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"==> run_id={run_id}  {len(df)} images, "
-          f"{df.group_id.nunique()} groups, {len(labels)} classes")
+          f"{df.group_id.nunique()} {unit}s, {len(labels)} classes")
 
-    all_metrics, preds_table = {}, {"path": df.path, "y_true": y,
-                                    "group_id": groups, "outer_fold": folds}
+    all_metrics, per_fold = {}, []
+    preds = {"path": df.path, "y_true": y, "group_id": groups,
+             "outer_fold": folds}
 
     for name in models:
         print(f"\n--- {name}")
-        est, grid = model_grid(name, seed)
-        pipe = Pipeline([("scale", StandardScaler()), ("clf", est)])
-
         oof_pred = np.empty(len(df), dtype=object)
         oof_prob = np.zeros((len(df), len(labels)))
         chosen, t0 = [], time.time()
 
         for k in range(n_folds):
-            tr_mask, te_mask = folds != k, folds == k
-            tr_df = df[tr_mask].reset_index(drop=True)
-            cv = inner_cv_for_fold(tr_df, inner, k)
+            tr, te = folds != k, folds == k
+            cv = inner_cv_for_fold(df[tr].reset_index(drop=True), inner, k)
+            est, params = fit_tuned(name, X[tr], y[tr], cv, seed)
+            chosen.append({kk.replace("clf__", ""): vv for kk, vv in params.items()})
 
-            gs = GridSearchCV(pipe, grid, cv=cv, scoring="balanced_accuracy",
-                              n_jobs=-1, refit=True)
-            gs.fit(X[tr_mask], y[tr_mask])
-            chosen.append(gs.best_params_)
+            oof_pred[te] = est.predict(X[te])
+            prob = est.predict_proba(X[te])
+            col = [list(est.classes_).index(l) for l in labels]
+            oof_prob[te] = prob[:, col]
 
-            oof_pred[te_mask] = gs.predict(X[te_mask])
-            prob = gs.predict_proba(X[te_mask])
-            # Align probability columns to the global label order.
-            col = [list(gs.best_estimator_.classes_).index(l) for l in labels]
-            oof_prob[te_mask] = prob[:, col]
-            print(f"    fold {k}: inner best {gs.best_params_}  "
-                  f"outer acc {accuracy_score(y[te_mask], oof_pred[te_mask]):.4f}")
+            fm = metric_bundle(y[te], oof_pred[te], oof_prob[te], labels)
+            per_fold.append({"model": name, "fold": k, "n": int(te.sum()),
+                             **{kk: vv for kk, vv in fm.items()
+                                if "::" not in kk}})
+            print(f"    fold {k}: acc {fm['accuracy']:.4f}  "
+                  f"bal {fm['balanced_accuracy']:.4f}  {params}")
 
         elapsed = time.time() - t0
         oof_pred = oof_pred.astype(str)
 
-        m = full_metrics(y, oof_pred, oof_prob, labels)
-        m["fit_predict_seconds"] = round(elapsed, 1)
-        m["chosen_hyperparameters_per_fold"] = [
-            {k2.replace("clf__", ""): v for k2, v in c.items()} for c in chosen]
-
-        for metric_name, fn in [
-            ("accuracy", accuracy_score),
-            ("balanced_accuracy", balanced_accuracy_score),
-            ("macro_f1", lambda a, b: f1_score(a, b, average="macro",
-                                               zero_division=0)),
-        ]:
-            lo, hi = group_bootstrap(y, oof_pred, groups, fn, n_boot, seed)
-            m[f"{metric_name}_ci95"] = [lo, hi]
-
-        all_metrics[name] = m
-        preds_table[f"pred_{name}"] = oof_pred
+        m = metric_bundle(y, oof_pred, oof_prob, labels)
+        ci = bootstrap_all(y, oof_pred, oof_prob, groups, labels, n_boot, seed)
+        entry = {"point": m, "ci95": ci,
+                 "confusion_matrix": confusion_frame(y, oof_pred, labels).values.tolist(),
+                 "labels": labels,
+                 "support": {l: int((y == l).sum()) for l in labels},
+                 "bootstrap_unit": unit,
+                 "fit_predict_seconds": round(elapsed, 1),
+                 "chosen_hyperparameters_per_fold": chosen}
+        all_metrics[name] = entry
+        preds[f"pred_{name}"] = oof_pred
         for i, lab in enumerate(labels):
-            preds_table[f"prob_{name}_{lab}"] = oof_prob[:, i]
+            preds[f"prob_{name}_{lab}"] = oof_prob[:, i]
 
-        print(f"    accuracy {m['accuracy']:.4f} "
-              f"[{m['accuracy_ci95'][0]:.4f}, {m['accuracy_ci95'][1]:.4f}]  "
-              f"balanced {m['balanced_accuracy']:.4f}  "
-              f"macroF1 {m['macro_f1']:.4f}  {elapsed:.0f}s")
+        a, b = ci.get("accuracy", [np.nan, np.nan])
+        print(f"    pooled: acc {m['accuracy']:.4f} [{a:.4f}, {b:.4f}]  "
+              f"bal {m['balanced_accuracy']:.4f}  macroF1 {m['macro_f1']:.4f}  "
+              f"AUC {m.get('roc_auc_macro', float('nan')):.4f}  "
+              f"Brier {m.get('brier', float('nan')):.4f}  "
+              f"ECE {m.get('ece', float('nan')):.4f}  {elapsed:.0f}s")
 
-    # -- pairwise significance -------------------------------------------------
+    # -- pairwise comparisons --------------------------------------------------
     print("\n--- pairwise comparisons")
     comparisons = []
     for a, b in combinations(models, 2):
-        pa, pb = preds_table[f"pred_{a}"], preds_table[f"pred_{b}"]
-        ca, cb = (pa == y), (pb == y)
-        n01, n10 = int((~ca & cb).sum()), int((ca & ~cb).sum())
+        pa, pb = preds[f"pred_{a}"], preds[f"pred_{b}"]
+        ca, cb = pa == y, pb == y
+        n10, n01 = int((ca & ~cb).sum()), int((~ca & cb).sum())
         res = mcnemar(np.array([[int((ca & cb).sum()), n10],
                                 [n01, int((~ca & ~cb).sum())]]), exact=True)
-        d, lo, hi, pb_ = paired_group_bootstrap(
+        d, lo, hi, pboot = paired_group_bootstrap(
             y, pa, pb, groups, accuracy_score, n_boot, seed)
-        comparisons.append({
-            "model_a": a, "model_b": b,
-            "a_only_correct": n10, "b_only_correct": n01,
-            "mcnemar_exact_p": float(res.pvalue),
-            "acc_diff": d, "acc_diff_ci95": [lo, hi], "bootstrap_p": pb_,
-        })
-        print(f"    {a} vs {b}: diff {d:+.4f} [{lo:+.4f}, {hi:+.4f}]  "
-              f"McNemar p={res.pvalue:.4f}  bootstrap p={pb_:.4f}")
+        comparisons.append({"model_a": a, "model_b": b,
+                            "a_only_correct": n10, "b_only_correct": n01,
+                            "mcnemar_exact_p": float(res.pvalue),
+                            "acc_diff": d, "acc_diff_ci95": [lo, hi],
+                            "bootstrap_p": pboot})
+        print(f"    {a} vs {b}: {d:+.4f} [{lo:+.4f}, {hi:+.4f}]  "
+              f"McNemar p={res.pvalue:.4f}  bootstrap p={pboot:.4f}")
 
-    # Holm-Bonferroni across the family of pairwise tests.
     order = np.argsort([c["mcnemar_exact_p"] for c in comparisons])
-    n_cmp = len(comparisons)
     running = 0.0
     for rank, i in enumerate(order):
-        adj = min(1.0, max(running, comparisons[i]["mcnemar_exact_p"] * (n_cmp - rank)))
+        adj = min(1.0, max(running,
+                           comparisons[i]["mcnemar_exact_p"] * (len(comparisons) - rank)))
         comparisons[i]["mcnemar_p_holm"] = float(adj)
         running = adj
 
-    print("\n  NOTE: McNemar assumes independent observations. With ~4-16")
-    print("  correlated slices per patient that assumption is violated, so the")
-    print("  group-level paired bootstrap is the primary test here and McNemar")
-    print("  is reported because it was requested. Where they disagree, trust")
-    print("  the bootstrap.")
+    print(f"\n  NOTE: McNemar assumes independent observations, which "
+          f"{df.groupby('group_id').size().mean():.1f} correlated images per "
+          f"{unit}\n  violates. The paired {unit}-level bootstrap is the "
+          f"primary test; McNemar is\n  reported because it was requested. "
+          f"Where they disagree, the bootstrap governs.")
 
     # -- write -----------------------------------------------------------------
-    payload = {
-        "run_id": run_id, "config": config, "split_mode": split_mode,
-        "seed": seed, "n_folds": n_folds, "n_images": len(df),
-        "n_groups": int(df.group_id.nunique()), "labels": labels,
-        "class_counts": df.label.value_counts().to_dict(),
-        "models": all_metrics, "comparisons": comparisons,
-    }
+    payload = {"run_id": run_id, "config": config, "split_mode": split_mode,
+               "seed": seed, "n_folds": n_folds, "n_images": len(df),
+               "n_groups": int(df.group_id.nunique()), "bootstrap_unit": unit,
+               "labels": labels,
+               "class_counts": df.label.value_counts().to_dict(),
+               "models": all_metrics, "comparisons": comparisons}
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2))
-    pd.DataFrame(preds_table).to_csv(out_dir / "predictions.csv", index=False)
+    pd.DataFrame(preds).to_csv(out_dir / "predictions.csv", index=False)
 
-    summary = pd.DataFrame([{
-        "model": k,
-        "accuracy": v["accuracy"],
-        "acc_ci_lo": v["accuracy_ci95"][0], "acc_ci_hi": v["accuracy_ci95"][1],
-        "balanced_accuracy": v["balanced_accuracy"],
-        "macro_f1": v["macro_f1"],
-        "roc_auc_macro": v.get("roc_auc_ovr_macro", float("nan")),
-        "seconds": v["fit_predict_seconds"],
-    } for k, v in all_metrics.items()]).sort_values("accuracy", ascending=False)
+    pf = pd.DataFrame(per_fold)
+    pf.to_csv(out_dir / "per_fold.csv", index=False)
+
+    rows = []
+    for k, v in all_metrics.items():
+        r = {"model": k}
+        for mk in ["accuracy", "balanced_accuracy", "macro_f1",
+                   "roc_auc_macro", "brier", "ece"]:
+            r[mk] = v["point"].get(mk, np.nan)
+            if mk in v["ci95"]:
+                r[f"{mk}_lo"], r[f"{mk}_hi"] = v["ci95"][mk]
+        r["seconds"] = v["fit_predict_seconds"]
+        rows.append(r)
+    summary = pd.DataFrame(rows).sort_values("accuracy", ascending=False)
     summary.to_csv(out_dir / "summary.csv", index=False)
+    print("\n" + summary.round(4).to_string(index=False))
 
-    print(f"\n{summary.to_string(index=False)}")
-    print(f"\n  wrote {out_dir}/")
+    print("\n  between-fold spread (a single random split lands anywhere here):")
+    print(pf.groupby("model").accuracy.agg(["min", "mean", "max", "std"])
+            .round(4).to_string())
 
     for name, v in all_metrics.items():
         print(f"\n  per-class -- {name}")
-        print(pd.DataFrame(v["per_class"]).T[
-            ["support", "precision", "recall_sensitivity",
-             "specificity", "f1"]].round(3).to_string())
+        t = pd.DataFrame({
+            met: {l: v["point"].get(f"{met}::{l}", np.nan) for l in labels}
+            for met in ["precision", "recall", "specificity", "f1", "auc"]})
+        t["support"] = pd.Series(v["support"])
+        print(t.round(3).to_string())
+        print("  confusion (rows true, cols predicted):")
+        print(pd.DataFrame(v["confusion_matrix"], index=labels,
+                           columns=labels).to_string())
+
+    print(f"\n  wrote {out_dir}/")
 
 
-def compare_runs(dirs: list[str]) -> None:
-    """Side-by-side table across runs, e.g. grouped vs image-level split."""
+def compare_runs(dirs):
     rows = []
     for d in dirs:
         p = Path(d)
@@ -400,39 +446,36 @@ def compare_runs(dirs: list[str]) -> None:
             p = RUNS / d
         meta = json.loads((p / "metrics.json").read_text())
         for name, m in meta["models"].items():
-            rows.append({
-                "run": meta["run_id"], "split": meta["split_mode"],
-                "model": name, "accuracy": m["accuracy"],
-                "ci_lo": m["accuracy_ci95"][0], "ci_hi": m["accuracy_ci95"][1],
-                "balanced_accuracy": m["balanced_accuracy"],
-                "macro_f1": m["macro_f1"],
-            })
+            pt, ci = m["point"], m["ci95"]
+            rows.append({"run": meta["run_id"], "split": meta["split_mode"],
+                         "model": name, "accuracy": pt["accuracy"],
+                         "ci_lo": ci.get("accuracy", [np.nan] * 2)[0],
+                         "ci_hi": ci.get("accuracy", [np.nan] * 2)[1],
+                         "balanced_accuracy": pt["balanced_accuracy"],
+                         "macro_f1": pt["macro_f1"]})
     t = pd.DataFrame(rows)
-    print(t.to_string(index=False))
-
+    print(t.round(4).to_string(index=False))
     if t.split.nunique() > 1:
         piv = t.pivot_table(index="model", columns="split", values="accuracy")
         if {"grouped", "image"} <= set(piv.columns):
-            piv["leakage_inflation"] = (piv["image"] - piv["grouped"]).round(4)
+            piv["leakage_inflation"] = piv["image"] - piv["grouped"]
             print("\nAccuracy inflation attributable to image-level splitting:")
             print(piv.round(4).to_string())
 
 
-def main() -> None:
+def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="main")
     ap.add_argument("--models", nargs="+",
                     default=["svm", "knn", "rf", "mlp", "logreg"])
-    ap.add_argument("--split-mode", choices=["grouped", "image"],
-                    default="grouped")
+    ap.add_argument("--split-mode", choices=["grouped", "image"], default="grouped")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--tag", default=None)
     ap.add_argument("--bootstrap", type=int, default=2000)
     ap.add_argument("--compare", nargs="+", default=None)
     a = ap.parse_args()
-
     if a.compare:
         compare_runs(a.compare)
     else:
