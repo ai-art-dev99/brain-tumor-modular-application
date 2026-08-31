@@ -1,54 +1,48 @@
 #!/usr/bin/env python3
 """
-explain.py -- quantitative interpretability, error analysis, and deferral.
+explain.py (v2) -- selective prediction, calibration, and quantitative
+attribution.
 
-WHY QUANTITATIVE
-----------------
-Reviewer point 9 asks for interpretability analysis, not illustration. A
-figure showing three well-chosen Grad-CAM overlays proves nothing: the
-selection is the result. The Figshare subset ships a binary tumour mask with
-every slice, so attribution can be scored rather than displayed.
+CHANGES FROM v1
+---------------
+1. DEFERRAL IS NOW AT THE LEVEL OF THE INDEPENDENT UNIT, NOT THE SLICE.
+   v1 ranked individual images by confidence and withheld the least confident.
+   That is not a decision anyone makes: a radiologist is handed an
+   examination, not a slice. Worse, with ~16 slices per glioma patient,
+   image-level deferral silently withholds part of a patient while reporting
+   accuracy on the rest of the same patient -- the same correlation problem
+   that made image-level splitting misleading. Predictions are now pooled
+   within a group, and whole groups are deferred.
 
-METRICS
--------
-  mask_energy      fraction of total saliency mass falling inside the tumour
-                   mask. The primary measure.
-  mask_area        fraction of the image the mask occupies. This is what
-                   mask_energy would be for a uniform, uninformative map.
-  concentration    mask_energy / mask_area. 1.0 means the attribution is no
-                   better than uniform; higher means saliency concentrates on
-                   the lesion. This ratio, not mask_energy alone, is the
-                   quantity to report -- a large tumour trivially captures a
-                   large share of a diffuse map.
-  pointing_hit     whether the single most salient pixel lies inside the mask
-                   (the standard pointing game).
-  iou              overlap between the mask and the top-k% most salient pixels,
-                   with k set to the mask's own area so the comparison is fair.
-  background_frac  saliency mass falling outside the head altogether, using an
-                   Otsu-derived head mask. High values indicate the model is
-                   keying on acquisition artefacts rather than anatomy.
+2. CALIBRATION IS MEASURED, NOT ASSUMED. A deferral curve only means something
+   if the scores rank uncertainty honestly. Brier score, expected and maximum
+   calibration error, and a reliability table are reported for every model.
+   Random forests in particular produce badly calibrated votes here
+   (ECE ~0.15-0.21) and should not be presented as probabilities.
 
-MASK ALIGNMENT
---------------
-Only rows with source == 'figshare' are used for mask-based scoring. Some
-SARTAJ rows inherited a mask_path through duplicate-cluster propagation, but
-those files were independently rescaled and cropped before redistribution, so
-the mask is not guaranteed to register against them. Scoring on them would
-silently corrupt every number in this script.
+3. RISK-COVERAGE AND AURC. The deferral table is a few points on a curve; the
+   area under the risk-coverage curve summarises the whole of it in one number
+   and is the standard measure in the selective-prediction literature. An
+   oracle bound is printed alongside so the value has a scale.
 
-THE 'NO TUMOUR' CLASS
----------------------
-No mask exists for it, and none could. What is measured instead is where the
-attribution lands: if a large share falls outside the head, the model is
-reading the acquisition rather than the anatomy. Read alongside the
-repository-classification probe in features.py.
+4. THE BACKGROUND-FRACTION METRIC IS REPORTED AGAINST ITS BASELINE.
+   v1 reported the share of attribution falling outside the head as though a
+   high value were evidence of a shortcut. It is not: the background occupies
+   roughly half the resized image, and Grad-CAM for EfficientNetB0 is computed
+   on a 7x7 grid and upsampled, so each cell spans ~32 pixels and inevitably
+   bleeds past the skull. The measured head area is now computed and printed
+   next to it. Interpret the difference, not the raw number -- and note that
+   the evidence for acquisition shortcuts comes from probe_shortcut.py, which
+   does not depend on this metric at all.
+
+5. "patients kept" renamed. Only the Figshare subset carries genuine patient
+   identifiers; elsewhere a group is a near-duplicate cluster standing in for
+   a patient. The column follows whichever the run actually has.
 
 Usage
 -----
-    python train_cnn.py --config main --epochs 20 --tag main_finetuned \\
-        --save-checkpoints            # needed first, if not already saved
-    python explain.py --run main_finetuned --max-per-class 150
-    python explain.py --run main_finetuned --deferral
+    python explain.py --run main_finetuned_v2 --mode deferral
+    python explain.py --run main_finetuned_v2 --mode cam --max-per-class 200
 """
 
 from __future__ import annotations
@@ -62,282 +56,337 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import timm
-import torch
-from PIL import Image
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from scipy import ndimage
-from skimage.filters import threshold_otsu
-from torchvision import transforms
-from tqdm import tqdm
 
 RUNS = Path("/workspace/outputs/runs")
 SPLITS = Path("/workspace/data/manifest/splits")
 
 
 # =============================================================================
-# Saliency scoring
+# Calibration
 # =============================================================================
 
-def score_map(cam: np.ndarray, mask: np.ndarray | None,
-              head: np.ndarray) -> dict:
-    """All attribution metrics for one image."""
-    cam = np.clip(cam, 0, None)
-    total = cam.sum()
-    if total <= 0:
-        return {}
+def calibration_table(conf: np.ndarray, correct: np.ndarray,
+                      n_bins: int = 15) -> pd.DataFrame:
+    edges = np.linspace(0, 1, n_bins + 1)
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.sum():
+            rows.append({"bin_lo": lo, "bin_hi": hi, "n": int(m.sum()),
+                         "mean_confidence": float(conf[m].mean()),
+                         "accuracy": float(correct[m].mean()),
+                         "gap": float(correct[m].mean() - conf[m].mean())})
+    return pd.DataFrame(rows)
 
-    out = {"background_frac": float(cam[~head].sum() / total)}
 
-    if mask is None or mask.sum() == 0:
-        return out
-
-    area = mask.mean()
-    energy = float(cam[mask].sum() / total)
-    out.update({
-        "mask_area": float(area),
-        "mask_energy": energy,
-        # Normalising by area is what separates "the map found the lesion"
-        # from "the lesion is large".
-        "concentration": float(energy / area) if area > 0 else np.nan,
-        "pointing_hit": bool(mask[np.unravel_index(cam.argmax(), cam.shape)]),
-    })
-
-    # Threshold the map at its own top-(area) quantile, so the predicted region
-    # has the same size as the ground-truth mask and IoU is not biased by the
-    # arbitrary choice of a fixed threshold.
-    k = max(1, int(round(area * cam.size)))
-    thr = np.partition(cam.ravel(), -k)[-k]
-    pred = cam >= thr
-    inter = np.logical_and(pred, mask).sum()
-    union = np.logical_or(pred, mask).sum()
-    out["iou"] = float(inter / union) if union else 0.0
+def calibration_metrics(conf, correct, P=None, y_idx=None, k=None) -> dict:
+    t = calibration_table(conf, correct)
+    w = t.n / t.n.sum()
+    out = {
+        "ece": float((w * t.gap.abs()).sum()),
+        "mce": float(t.gap.abs().max()),
+        "mean_confidence": float(conf.mean()),
+        "accuracy": float(correct.mean()),
+        # Positive means the model is under-confident, negative over-confident.
+        "confidence_gap": float(correct.mean() - conf.mean()),
+    }
+    if P is not None:
+        out["brier"] = float(((P - np.eye(k)[y_idx]) ** 2).sum(1).mean())
     return out
 
 
-def head_mask(img: np.ndarray) -> np.ndarray:
-    """Approximate head region by Otsu thresholding, then fill interior holes."""
-    try:
-        t = threshold_otsu(img)
-    except Exception:
-        t = img.mean()
-    m = ndimage.binary_fill_holes(img > t)
-    if m.sum() < 0.02 * m.size:      # degenerate threshold
-        return np.ones_like(m, dtype=bool)
-    return m.astype(bool)
+# =============================================================================
+# Selective prediction
+# =============================================================================
+
+def risk_coverage(conf: np.ndarray, correct: np.ndarray) -> tuple:
+    """
+    Risk (error rate) as a function of coverage, retaining the most confident
+    cases first. AURC summarises the curve; the oracle bound -- perfect ranking
+    of errors to the bottom -- gives it a scale.
+    """
+    order = np.argsort(-conf)
+    err = (~correct.astype(bool)).astype(float)[order]
+    n = len(err)
+    cov = np.arange(1, n + 1) / n
+    risk = np.cumsum(err) / np.arange(1, n + 1)
+
+    oracle = np.sort(err)                       # all correct cases first
+    orisk = np.cumsum(oracle) / np.arange(1, n + 1)
+    return cov, risk, float(risk.mean()), float(orisk.mean())
+
+
+def group_level(df: pd.DataFrame, labels: list[str], model: str):
+    """
+    Pool slice probabilities within a group and produce one prediction per
+    independent unit. Averaging probabilities rather than taking a majority
+    vote keeps the confidence continuous, which the deferral ranking needs.
+    """
+    cols = [f"prob_{model}_{l}" for l in labels]
+    g = df.groupby("group_id")
+    P = g[cols].mean().to_numpy()
+    truth = g.y_true.first().to_numpy()
+    size = g.size().to_numpy()
+    ids = np.array(list(g.groups.keys()))
+    pred = np.array(labels)[P.argmax(1)]
+    return ids, truth, pred, P, size
+
+
+def deferral(args) -> None:
+    run_dir = RUNS / args.run
+    meta = json.loads((run_dir / "metrics.json").read_text())
+    labels = meta["labels"]
+    unit = meta.get("bootstrap_unit", "group")
+    preds = pd.read_csv(run_dir / "predictions.csv")
+
+    models = sorted({c.split("pred_", 1)[1] for c in preds.columns
+                     if c.startswith("pred_")})
+    y = preds.y_true.to_numpy()
+
+    print("=" * 74)
+    print(f"Selective prediction -- {args.run}")
+    print(f"independent unit: {unit}   "
+          f"({preds.group_id.nunique()} units, {len(preds)} images)")
+    print("=" * 74)
+
+    cal_rows, curve_rows, rel_rows = [], [], []
+
+    for mdl in models:
+        cols = [f"prob_{mdl}_{l}" for l in labels]
+        if not all(c in preds.columns for c in cols):
+            continue
+
+        # -- calibration, at both levels --------------------------------------
+        Pi = preds[cols].to_numpy()
+        ci = Pi.max(1)
+        corr_i = (preds[f"pred_{mdl}"].to_numpy() == y)
+        yi = np.array([labels.index(v) for v in y])
+        m_img = calibration_metrics(ci, corr_i.astype(float), Pi, yi, len(labels))
+
+        ids, gt, gp, Pg, gsize = group_level(preds, labels, mdl)
+        cg = Pg.max(1)
+        corr_g = (gp == gt)
+        yg = np.array([labels.index(v) for v in gt])
+        m_grp = calibration_metrics(cg, corr_g.astype(float), Pg, yg, len(labels))
+
+        for lvl, m in [("image", m_img), (unit, m_grp)]:
+            cal_rows.append({"model": mdl, "level": lvl, **m})
+
+        for lo, hi, n, mc, acc, gap in calibration_table(cg, corr_g.astype(float)).values:
+            rel_rows.append({"model": mdl, "bin_lo": lo, "bin_hi": hi,
+                             "n": n, "mean_confidence": mc, "accuracy": acc})
+
+        # -- risk-coverage ----------------------------------------------------
+        _, _, aurc, oracle = risk_coverage(cg, corr_g)
+
+        print(f"\n  {mdl}")
+        print(f"    calibration  image: ECE {m_img['ece']:.4f}  "
+              f"Brier {m_img['brier']:.4f}   |   "
+              f"{unit}: ECE {m_grp['ece']:.4f}  Brier {m_grp['brier']:.4f}")
+        print(f"    AURC {aurc:.4f}  (oracle {oracle:.4f})")
+        if m_grp["ece"] > 0.10:
+            print(f"    !! ECE {m_grp['ece']:.3f}: these scores are not usable "
+                  f"as probabilities.\n       Exclude this model from the "
+                  f"deferral claim or recalibrate it.")
+
+        # -- deferral table, whole units withheld -----------------------------
+        order = np.argsort(cg)                  # least confident first
+        print(f"    {'defer':>6}  {'units':>6}  {'images':>7}  "
+              f"{'unit acc':>9}  {'image acc':>10}")
+        for frac in [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]:
+            n_def = int(round(frac * len(ids)))
+            keep = np.ones(len(ids), bool)
+            keep[order[:n_def]] = False
+            kept_ids = set(ids[keep])
+            im = preds.group_id.isin(kept_ids).to_numpy()
+            uacc = corr_g[keep].mean() if keep.any() else np.nan
+            iacc = corr_i[im].mean() if im.any() else np.nan
+            curve_rows.append({"model": mdl, "defer_frac": frac,
+                               "units_kept": int(keep.sum()),
+                               "images_kept": int(im.sum()),
+                               "unit_accuracy": float(uacc),
+                               "image_accuracy": float(iacc)})
+            print(f"    {frac:6.0%}  {keep.sum():6d}  {im.sum():7d}  "
+                  f"{uacc:9.4f}  {iacc:10.4f}")
+
+    pd.DataFrame(cal_rows).to_csv(run_dir / "calibration.csv", index=False)
+    pd.DataFrame(curve_rows).to_csv(run_dir / "deferral_curve.csv", index=False)
+    pd.DataFrame(rel_rows).to_csv(run_dir / "reliability_bins.csv", index=False)
+
+    print(f"\n  wrote calibration.csv, deferral_curve.csv, reliability_bins.csv")
+    print("\n  Reporting notes:")
+    print("    - Deferral withholds whole units, so a referred case costs a")
+    print("      full examination of radiologist time, not one slice. Report")
+    print("      the images column too: it is the real workload transferred.")
+    print("    - Frame this as triage or selective prediction, never as")
+    print("      autonomous diagnosis.")
+    print("    - Accuracy on retained cases is conditional on the model's own")
+    print("      confidence ordering and is not a diagnostic accuracy that")
+    print("      would transfer to an unselected population.")
 
 
 # =============================================================================
+# Attribution
+# =============================================================================
 
-def run_cam(args) -> None:
+def cam(args) -> None:
+    import timm
+    import torch
+    from PIL import Image
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    from scipy import ndimage
+    from skimage.filters import threshold_otsu
+    from torchvision import transforms
+    from tqdm import tqdm
+
+    def head_mask(g):
+        try:
+            t = threshold_otsu(g)
+        except Exception:
+            t = g.mean()
+        m = ndimage.binary_fill_holes(g > t)
+        return m.astype(bool) if m.sum() >= 0.02 * m.size else np.ones_like(m, bool)
+
+    def score(cmap, mask, head):
+        cmap = np.clip(cmap, 0, None)
+        tot = cmap.sum()
+        if tot <= 0:
+            return {}
+        out = {"background_frac": float(cmap[~head].sum() / tot),
+               "head_area": float(head.mean())}
+        if mask is None or mask.sum() == 0:
+            return out
+        area = mask.mean()
+        energy = float(cmap[mask].sum() / tot)
+        out.update({"mask_area": float(area), "mask_energy": energy,
+                    "concentration": float(energy / area) if area else np.nan,
+                    "pointing_hit": bool(mask[np.unravel_index(cmap.argmax(),
+                                                               cmap.shape)])})
+        k = max(1, int(round(area * cmap.size)))
+        thr = np.partition(cmap.ravel(), -k)[-k]
+        p = cmap >= thr
+        u = np.logical_or(p, mask).sum()
+        out["iou"] = float(np.logical_and(p, mask).sum() / u) if u else 0.0
+        return out
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     run_dir = RUNS / args.run
     meta = json.loads((run_dir / "metrics.json").read_text())
     labels = meta["labels"]
-    config = meta["config"]
-
-    df = pd.read_csv(SPLITS / f"splits_{config}_outer.csv")
-    preds = pd.read_csv(run_dir / "predictions.csv")
-    df = df.merge(preds[["path", "pred_cnn"]], on="path", how="left")
-    df["patient_id"] = df.patient_id.fillna("")
+    df = pd.read_csv(SPLITS / f"splits_{meta['config']}_outer.csv")
+    df = df.merge(pd.read_csv(run_dir / "predictions.csv")[["path", "pred_cnn"]],
+                  on="path", how="left")
     df["mask_path"] = df.mask_path.fillna("")
 
-    probe = timm.create_model("efficientnet_b0", pretrained=False,
-                              num_classes=len(labels))
-    cfg = timm.data.resolve_model_data_config(
-        timm.create_model("efficientnet_b0", pretrained=False, num_classes=0))
+    tmp = timm.create_model("efficientnet_b0", pretrained=False, num_classes=0)
+    cfg = timm.data.resolve_model_data_config(tmp)
     size = cfg["input_size"][1]
-    tf = transforms.Compose([
-        transforms.Resize((size, size)),
-        transforms.ToTensor(),
-        transforms.Normalize(cfg["mean"], cfg["std"]),
-    ])
-    del probe
+    del tmp
+    tf = transforms.Compose([transforms.Resize((size, size)),
+                             transforms.ToTensor(),
+                             transforms.Normalize(cfg["mean"], cfg["std"])])
 
-    # Balanced subsample per class per fold: Grad-CAM is expensive and the
-    # estimate does not improve much beyond a few hundred images per class.
     rng = np.random.default_rng(args.seed)
-    picks = []
-    for (fold, lab), g in df.groupby(["outer_fold", "label"]):
-        n = min(len(g), max(1, args.max_per_class // df.outer_fold.nunique()))
-        picks.append(g.iloc[rng.choice(len(g), n, replace=False)])
-    sample = pd.concat(picks).reset_index(drop=True)
-    print(f"==> scoring {len(sample)} images "
-          f"({args.max_per_class} per class, spread over folds)")
+    per_fold = max(1, args.max_per_class // df.outer_fold.nunique())
+    sample = pd.concat([g.iloc[rng.choice(len(g), min(len(g), per_fold),
+                                          replace=False)]
+                        for _, g in df.groupby(["outer_fold", "label"])
+                        ]).reset_index(drop=True)
+    print(f"==> scoring {len(sample)} images")
 
     rows = []
     for fold in sorted(sample.outer_fold.unique()):
-        ckpt = run_dir / f"backbone_fold{fold}.pt"
-        if not ckpt.exists():
-            raise SystemExit(
-                f"{ckpt} not found. Re-run train_cnn.py with --save-checkpoints; "
-                f"attribution must come from the model that produced the "
-                f"predictions, not a retrained one.")
+        ck = run_dir / f"backbone_fold{fold}.pt"
+        if not ck.exists():
+            raise SystemExit(f"{ck} missing. Re-run train_cnn.py with "
+                             f"--save-checkpoints: attribution must come from "
+                             f"the model that made the predictions.")
         model = timm.create_model("efficientnet_b0", pretrained=False,
                                   num_classes=len(labels))
-        model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        model.load_state_dict(torch.load(ck, map_location="cpu"))
         model.eval().to(device)
-        cam_engine = GradCAM(model=model, target_layers=[model.conv_head])
+        engine = GradCAM(model=model, target_layers=[model.conv_head])
 
         sub = sample[sample.outer_fold == fold]
         for _, r in tqdm(sub.iterrows(), total=len(sub), desc=f"fold {fold}"):
             img = Image.open(r.path).convert("RGB")
-            x = tf(img).unsqueeze(0).to(device)
-            cls = labels.index(r.pred_cnn) if isinstance(r.pred_cnn, str) \
-                else labels.index(r.label)
-            cam = cam_engine(input_tensor=x,
-                             targets=[ClassifierOutputTarget(cls)])[0]
-
-            grey = np.asarray(img.convert("L").resize((size, size)),
-                              dtype=np.float32)
-            head = head_mask(grey)
-
-            # Masks are only trustworthy on the Figshare renders themselves.
-            mask = None
-            if r.source == "figshare" and r.mask_path:
-                mp = Path(r.mask_path)
-                if mp.exists():
-                    mk = np.asarray(Image.open(mp).convert("L")
-                                    .resize((size, size), Image.NEAREST))
-                    mask = mk > 127
-
-            m = score_map(cam, mask, head)
-            if m:
-                m.update({"path": r.path, "label": r.label,
-                          "pred": r.pred_cnn, "source": r.source,
-                          "patient_id": r.patient_id, "outer_fold": fold,
+            cls = labels.index(r.pred_cnn if isinstance(r.pred_cnn, str) else r.label)
+            cm = engine(input_tensor=tf(img).unsqueeze(0).to(device),
+                        targets=[ClassifierOutputTarget(cls)])[0]
+            grey = np.asarray(img.convert("L").resize((size, size)), np.float32)
+            hm = head_mask(grey)
+            # Masks register only against the Figshare renders themselves;
+            # SARTAJ copies were rescaled and cropped before redistribution.
+            mk = None
+            if r.source == "figshare" and r.mask_path and Path(r.mask_path).exists():
+                mk = np.asarray(Image.open(r.mask_path).convert("L")
+                                .resize((size, size), Image.NEAREST)) > 127
+            s = score(cm, mk, hm)
+            if s:
+                s.update({"path": r.path, "label": r.label, "pred": r.pred_cnn,
+                          "source": r.source, "outer_fold": fold,
                           "correct": r.pred_cnn == r.label,
-                          "has_mask": mask is not None})
-                rows.append(m)
-
-        del model, cam_engine
+                          "has_mask": mk is not None})
+                rows.append(s)
+        del model, engine
         torch.cuda.empty_cache()
 
     res = pd.DataFrame(rows)
     res.to_csv(run_dir / "attribution_scores.csv", index=False)
-    report(res, run_dir)
 
-
-def report(res: pd.DataFrame, run_dir: Path) -> None:
-    print("\n" + "=" * 70)
-    print("Attribution quality, tumour classes (Figshare masks)")
-    print("=" * 70)
-
+    print("\n" + "=" * 74)
+    print("Attribution concentration (Figshare masks only)")
+    print("=" * 74)
     m = res[res.has_mask]
     if len(m):
-        agg = m.groupby("label").agg(
-            n=("mask_energy", "size"),
-            mask_area=("mask_area", "mean"),
+        print(m.groupby("label").agg(
+            n=("mask_energy", "size"), mask_area=("mask_area", "mean"),
             mask_energy=("mask_energy", "mean"),
             concentration=("concentration", "mean"),
-            pointing=("pointing_hit", "mean"),
-            iou=("iou", "mean"),
-        ).round(3)
-        print(agg.to_string())
-        print("\n  concentration = mask_energy / mask_area.")
-        print("  1.0 is the uniform-map baseline: no localisation at all.")
-
-        print("\n  correct vs incorrect predictions:")
-        cc = m.groupby(["label", "correct"]).agg(
+            pointing=("pointing_hit", "mean"), iou=("iou", "mean")
+        ).round(3).to_string())
+        print("\n  concentration = mask_energy / mask_area; 1.0 is the "
+              "uniform-map baseline.")
+        print("\n  by correctness:")
+        print(m.groupby(["label", "correct"]).agg(
             n=("mask_energy", "size"),
             concentration=("concentration", "mean"),
-            pointing=("pointing_hit", "mean"),
-        ).round(3)
-        print(cc.to_string())
-        print("\n  If concentration is no higher on correct predictions than on")
-        print("  incorrect ones, the model is not succeeding by localising the")
-        print("  lesion, whatever the overlays look like.")
+            pointing=("pointing_hit", "mean")).round(3).to_string())
+        print("\n  Concentration higher on correct than incorrect predictions "
+              "means the model\n  succeeds by attending to the lesion. Where "
+              "the relation inverts, it does not.")
 
-    print("\n" + "=" * 70)
-    print("Saliency falling outside the head (all classes)")
-    print("=" * 70)
-    bg = res.groupby("label").background_frac.agg(["size", "mean", "median"]).round(3)
+    print("\n" + "=" * 74)
+    print("Attribution outside the head -- REPORT AGAINST THE BASELINE")
+    print("=" * 74)
+    bg = res.groupby("label").agg(n=("background_frac", "size"),
+                                  outside=("background_frac", "mean"),
+                                  head_area=("head_area", "mean")).round(3)
+    bg["background_area"] = (1 - bg.head_area).round(3)
+    bg["excess"] = (bg.outside - bg.background_area).round(3)
     print(bg.to_string())
-    print("\n  A class with markedly more attribution outside the head is being")
-    print("  decided on something other than brain anatomy.")
-
-    if "notumor" in set(res.label):
-        nt = res[res.label == "notumor"].background_frac.mean()
-        others = res[res.label != "notumor"].background_frac.mean()
-        print(f"\n  no tumour {nt:.3f} vs tumour classes {others:.3f} "
-              f"(ratio {nt / max(others, 1e-9):.2f}x)")
+    print("\n  'excess' is what matters: attribution outside the head minus the")
+    print("  share of the image the background actually occupies. Values near")
+    print("  zero mean the map is diffuse at the 7x7 Grad-CAM resolution, not")
+    print("  that the model attends to the background. Do not present the raw")
+    print("  'outside' column as evidence of a shortcut -- the evidence for that")
+    print("  comes from probe_shortcut.py and does not rest on this metric.")
 
     print("\n  confusion among sampled images:")
     print(pd.crosstab(res.label, res.pred).to_string())
     print(f"\n  wrote {run_dir / 'attribution_scores.csv'}")
 
 
-# =============================================================================
-
-def deferral(args) -> None:
-    """
-    Accuracy on retained cases as a function of how many low-confidence cases
-    are referred to a radiologist.
-
-    This is the clinically meaningful framing: a classifier that abstains on
-    the cases it cannot resolve is useful at an accuracy that a classifier
-    forced to answer everything is not.
-    """
-    run_dir = RUNS / args.run
-    meta = json.loads((run_dir / "metrics.json").read_text())
-    labels = meta["labels"]
-    preds = pd.read_csv(run_dir / "predictions.csv")
-
-    models = sorted({c.split("pred_", 1)[1] for c in preds.columns
-                     if c.startswith("pred_")})
-    y = preds.y_true.to_numpy()
-    groups = preds.group_id.to_numpy()
-
-    print("=" * 70)
-    print("Deferral analysis")
-    print("=" * 70)
-
-    curves = []
-    for mdl in models:
-        cols = [f"prob_{mdl}_{l}" for l in labels]
-        if not all(c in preds.columns for c in cols):
-            continue
-        P = preds[cols].to_numpy()
-        conf = P.max(1)
-        pred = preds[f"pred_{mdl}"].to_numpy()
-        correct = (pred == y)
-        order = np.argsort(conf)          # least confident first
-
-        print(f"\n  {mdl}")
-        print(f"    {'defer':>6}  {'kept':>6}  {'accuracy':>9}  "
-              f"{'groups kept':>14}")
-        for frac in [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50]:
-            n_def = int(round(frac * len(y)))
-            keep = np.ones(len(y), bool)
-            keep[order[:n_def]] = False
-            acc = correct[keep].mean() if keep.any() else np.nan
-            npat = len(np.unique(groups[keep]))
-            curves.append({"model": mdl, "defer_frac": frac,
-                           "n_kept": int(keep.sum()), "accuracy": float(acc),
-                           "groups_kept": npat})
-            print(f"    {frac:6.0%}  {keep.sum():6d}  {acc:9.4f}  {npat:14d}")
-
-    pd.DataFrame(curves).to_csv(run_dir / "deferral_curve.csv", index=False)
-    print(f"\n  wrote {run_dir / 'deferral_curve.csv'}")
-    print("\n  Report the operating point, not just the curve: state the")
-    print("  referral rate required to reach a target accuracy, and note that")
-    print("  referred cases still consume radiologist time -- the benefit is")
-    print("  triage, not replacement.")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--run", default="main_finetuned")
-    ap.add_argument("--max-per-class", type=int, default=150)
-    ap.add_argument("--deferral", action="store_true")
+    ap.add_argument("--run", default="main_finetuned_v2")
+    ap.add_argument("--mode", choices=["deferral", "cam"], default="deferral")
+    ap.add_argument("--max-per-class", type=int, default=200)
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args()
-    if a.deferral:
-        deferral(a)
-    else:
-        run_cam(a)
+    (deferral if a.mode == "deferral" else cam)(a)
 
 
 if __name__ == "__main__":
