@@ -54,6 +54,9 @@ Usage
 
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings('ignore')
+
 import argparse
 import json
 from pathlib import Path
