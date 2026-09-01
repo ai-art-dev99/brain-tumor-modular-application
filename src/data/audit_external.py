@@ -1,52 +1,43 @@
 #!/usr/bin/env python3
 """
-audit_external.py (v2) -- screen a candidate external dataset before any model
+audit_external.py (v3) -- screen a candidate external dataset before any model
 sees it.
 
-THREE QUESTIONS, THREE SCOPES
------------------------------
-v1 pooled every development image into one comparison, which conflated claims
-that need to be kept apart. The `aggregated` rows are the Nickparvar composite
-Kaggle benchmark, itself assembled from Figshare, SARTAJ and BR35H; those
-images were never used for training here, so a match against them is evidence
-about provenance, not contamination of this study.
+NEW IN v3: THE CANDIDATE'S OWN SPLIT
+------------------------------------
+Datasets distributed with train/val/test folders make a claim about those
+folders: that a model trained on one can be honestly evaluated on another.
+That claim is testable with the same near-duplicate clustering used
+internally, and on this benchmark family it has already failed twice. So the
+audit now:
 
-  trained    the 3,813 images that actually entered the experiments.
-             A match here means the model was tested on something it saw.
+  - records which published partition each image came from,
+  - reports whether near-duplicate groups straddle those partitions, which is
+    exactly the defect that inflates published accuracy on this benchmark,
+  - reports overlap with our development data per partition, so a decision to
+    use only the published test subset can be made on evidence.
 
-  sources    the original repositories (Figshare, SARTAJ, BR35H) before
-             deduplication, excluding the composite. A match here means the
-             candidate is drawn from the same source family, which is what
-             "genuinely independent source-based test set" rules out, even if
-             that particular image never entered training.
+A candidate that leaks internally is still usable as an external cohort for
+us -- we never train on it -- but the leakage is worth reporting, because it
+bears on every result others have published using that split.
 
-  composite  the Nickparvar aggregate. Reported separately so it is never
+THREE SCOPES (unchanged from v2)
+--------------------------------
+  trained    the 3,813 images that entered our experiments. A match means the
+             model would be tested on something it has seen.
+  sources    Figshare, SARTAJ and BR35H before deduplication, excluding the
+             composite. A match means shared source family, which is what
+             "independent source-based test set" rules out.
+  composite  the Nickparvar aggregate, reported separately so it is never
              mistaken for a fourth acquisition source.
 
-GROUP-LEVEL ACCOUNTING
-----------------------
-Overlap is counted over near-duplicate clusters, not files. Three re-encodings
-of one scan matching one development image are one contaminated unit, not
-three. A cluster is excluded whole if any member matches.
-
-SSIM CONFIRMATION
------------------
-A perceptual hash collision is evidence, not proof. Structural similarity is
-computed for every matched pair on a common grid, so the claim rests on two
-independent measures. Report the joint distribution rather than a single
-threshold.
-
-COUNT REPORTING
----------------
-Raw file counts are reported before any collapsing, then exact duplicates,
-then near-duplicate groups. Where a repository's published composition differs
-from the files it distributes, both numbers are stated; neither is silently
-substituted for the other.
+Overlap is counted over near-duplicate groups, not files, and confirmed with
+SSIM on a common grid so the claim rests on two independent measures.
 
 Usage
 -----
-    python audit_external.py --name pmram --root "/path/to/Raw"
-    python audit_external.py --name pmram --root ... --ssim-sample 400
+    python audit_external.py --name bdneuro_v7 --root "/path/to/dataset"
+    python audit_external.py --name bdneuro_v7 --root ... --restrict-split test
 """
 
 from __future__ import annotations
@@ -76,8 +67,16 @@ CLASS_ALIASES = {
     "meningioma": "meningioma", "brain_menin": "meningioma",
     "meningioma_tumor": "meningioma",
     "pituitary": "pituitary", "pituitary_tumor": "pituitary",
+    "pituitary_macroadenoma": "pituitary",
     "notumor": "notumor", "no_tumor": "notumor", "normal": "notumor",
     "brain_normal": "notumor", "no": "notumor", "healthy": "notumor",
+    "nontumor": "notumor", "non_tumor": "notumor",
+}
+
+SPLIT_ALIASES = {
+    "train": "train", "training": "train",
+    "val": "val", "valid": "val", "validation": "val",
+    "test": "test", "testing": "test",
 }
 
 POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
@@ -98,7 +97,6 @@ def hex_to_packed(s) -> np.ndarray:
 
 
 def dual_nearest(pa, da, pb, db, chunk: int = 256):
-    """Nearest neighbour under max(pHash, dHash) Hamming distance."""
     bi = np.zeros(len(pa), dtype=np.int64)
     bd = np.full(len(pa), 127, dtype=np.int16)
     for s in range(0, len(pa), chunk):
@@ -126,15 +124,25 @@ class DSU:
             self.p[rb] = ra
 
 
-def normalise_class(path: Path) -> str:
-    for part in reversed(path.parts):
-        k = part.strip().lower().replace(" ", "_").replace("-", "_")
-        # Some releases prefix class folders with the image size, e.g. PMRAM's
-        # "512Glioma". Without stripping it every image falls through.
-        k = re.sub(r"^\d+[_\-]?", "", k)
-        if k in CLASS_ALIASES:
+def _norm(part: str) -> str:
+    k = part.strip().lower().replace(" ", "_").replace("-", "_")
+    # Some releases prefix class folders with the image size, e.g. "512Glioma".
+    return re.sub(r"^\d+[_\-]?", "", k)
+
+
+def normalise_class(rel: Path) -> str:
+    for part in reversed(rel.parts):
+        if (k := _norm(part)) in CLASS_ALIASES:
             return CLASS_ALIASES[k]
     return "unknown"
+
+
+def detect_split(rel: Path) -> str:
+    """The partition the publisher shipped the image in, if any."""
+    for part in rel.parts:
+        if (k := _norm(part)) in SPLIT_ALIASES:
+            return SPLIT_ALIASES[k]
+    return "unassigned"
 
 
 def index_external(root: Path) -> pd.DataFrame:
@@ -144,6 +152,7 @@ def index_external(root: Path) -> pd.DataFrame:
     print(f"==> indexing {len(paths)} files under {root}")
     rows = []
     for p in tqdm(paths, unit="img"):
+        rel = p.relative_to(root)
         try:
             with Image.open(p) as im:
                 w, h = im.size
@@ -152,43 +161,35 @@ def index_external(root: Path) -> pd.DataFrame:
         except Exception as e:
             print(f"    unreadable, skipped: {p} ({e})")
             continue
-        rows.append({"path": str(p), "rel": str(p.relative_to(root)),
-                     "label": normalise_class(p.relative_to(root)),
+        rows.append({"path": str(p), "rel": str(rel),
+                     "label": normalise_class(rel),
+                     "published_split": detect_split(rel),
                      "width": w, "height": h, "bytes": p.stat().st_size,
                      "sha256": sha256_of(p), "phash": str(ph), "dhash": str(dh)})
     return pd.DataFrame(rows)
 
 
 def load_scope(scope: str) -> pd.DataFrame:
-    """Development images for one comparison scope."""
     files = pd.read_csv(MANIFEST / "files_index.csv")
     fig = pd.read_csv(MANIFEST / "figshare_index.csv")
     fig_rows = pd.DataFrame({"path": fig.render_path, "source": "figshare",
                              "class": fig["class"], "phash": fig.phash,
                              "dhash": fig.dhash, "sha256": ""})
+    cols = ["path", "source", "class", "phash", "dhash", "sha256"]
 
     if scope == "trained":
-        # Exactly what entered the experiments. dataset.csv carries the
-        # representative paths; hashes are joined back from the indices.
         ds = pd.read_csv(MANIFEST / "dataset.csv")
-        pool = pd.concat([files[["path", "source", "class", "phash", "dhash",
-                                 "sha256"]], fig_rows], ignore_index=True)
+        pool = pd.concat([files[cols], fig_rows], ignore_index=True)
         return pool[pool.path.isin(set(ds.path))].reset_index(drop=True)
-
     if scope == "sources":
         f = files[files.source.isin(["sartaj", "br35h"])]
-        return pd.concat([f[["path", "source", "class", "phash", "dhash",
-                             "sha256"]], fig_rows], ignore_index=True)
-
+        return pd.concat([f[cols], fig_rows], ignore_index=True)
     if scope == "composite":
-        f = files[files.source == "aggregated"]
-        return f[["path", "source", "class", "phash", "dhash",
-                  "sha256"]].reset_index(drop=True)
-
+        return files[files.source == "aggregated"][cols].reset_index(drop=True)
     raise SystemExit(f"unknown scope {scope}")
 
 
-def load_grey(p: str) -> np.ndarray | None:
+def load_grey(p: str):
     try:
         return np.asarray(Image.open(p).convert("L")
                           .resize((SSIM_SIZE, SSIM_SIZE)), dtype=np.float32)
@@ -196,53 +197,58 @@ def load_grey(p: str) -> np.ndarray | None:
         return None
 
 
+# =============================================================================
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--name", required=True)
     ap.add_argument("--root", required=True)
-    ap.add_argument("--threshold", type=int, default=2,
-                    help="dual-hash overlap threshold; keep at the value "
-                         "calibrated on the development data")
-    ap.add_argument("--group-threshold", type=int, default=2,
-                    help="internal near-duplicate clustering threshold")
-    ap.add_argument("--ssim-sample", type=int, default=400,
-                    help="matched pairs to confirm with SSIM (0 to skip)")
-    ap.add_argument("--published-per-class", type=int, default=None)
+    ap.add_argument("--threshold", type=int, default=2)
+    ap.add_argument("--group-threshold", type=int, default=2)
+    ap.add_argument("--restrict-split", default=None,
+                    choices=["train", "val", "test"],
+                    help="audit only one published partition")
+    ap.add_argument("--ssim-sample", type=int, default=400)
+    ap.add_argument("--published-total", type=int, default=None)
     ap.add_argument("--montage", type=int, default=12)
     ap.add_argument("--seed", type=int, default=42)
     a = ap.parse_args()
 
     EXTERNAL.mkdir(parents=True, exist_ok=True)
     ext = index_external(Path(a.root))
+
+    if a.restrict_split:
+        before = len(ext)
+        ext = ext[ext.published_split == a.restrict_split].reset_index(drop=True)
+        print(f"\n  restricted to published '{a.restrict_split}' partition: "
+              f"{len(ext)} of {before} images")
     n_raw = len(ext)
 
-    # -- counts, stated at every stage ----------------------------------------
-    print("\n" + "=" * 70)
+    # -- composition as distributed -------------------------------------------
+    print("\n" + "=" * 74)
     print("Composition as distributed")
-    print("=" * 70)
+    print("=" * 74)
     print(f"  files on disk: {n_raw}")
-    print(ext.label.value_counts().to_string())
-    if a.published_per_class:
-        pub = a.published_per_class * ext.label.nunique()
-        print(f"\n  published composition: {a.published_per_class} per class "
-              f"({pub} total)")
-        if n_raw != pub:
-            print(f"  DISCREPANCY: {n_raw} files distributed against {pub} "
-                  f"published.\n  These counts are of files as shipped, before "
-                  f"any deduplication here.\n  Report both; do not substitute "
-                  f"one for the other.")
+    print(pd.crosstab(ext.label, ext.published_split, margins=True).to_string())
+    if (ext.label == "unknown").any():
+        folders = sorted({Path(r).parent.name for r in
+                          ext.rel[ext.label == "unknown"]})
+        print(f"\n  WARNING: {(ext.label == 'unknown').sum()} images unmapped. "
+              f"Folders: {folders[:10]}")
+    if a.published_total and n_raw != a.published_total:
+        print(f"\n  DISCREPANCY: {n_raw} files distributed against "
+              f"{a.published_total} published.\n  Both counts are of files as "
+              f"shipped; report both rather than substituting one.")
 
     dup_exact = ext[ext.duplicated("sha256", keep=False)]
-    n_exact_groups = dup_exact.sha256.nunique()
-    print(f"\n  byte-identical duplicate files within the release: "
-          f"{len(dup_exact)} in {n_exact_groups} groups")
-
+    print(f"\n  byte-identical duplicate files: {len(dup_exact)} in "
+          f"{dup_exact.sha256.nunique()} groups")
     dims = ext.width.astype(str) + "x" + ext.height.astype(str)
     print(f"  distinct dimensions: {dims.nunique()} "
           f"(most common {dims.value_counts().index[0]})")
 
-    # -- internal near-duplicate grouping --------------------------------------
+    # -- near-duplicate grouping ----------------------------------------------
     ph, dh = hex_to_packed(ext.phash), hex_to_packed(ext.dhash)
     dsu = DSU(len(ext))
     for s in range(0, len(ext), 256):
@@ -259,17 +265,47 @@ def main() -> None:
     print(f"  near-duplicate groups (pseudo-patients): {n_groups} "
           f"({n_raw / n_groups:.2f} images per group)")
 
-    # -- one comparison per scope ---------------------------------------------
+    # -- does the publisher's own split leak? ---------------------------------
+    split_report = None
+    if ext.published_split.nunique() > 1 and not a.restrict_split:
+        print("\n" + "=" * 74)
+        print("Integrity of the publisher's own train/val/test split")
+        print("=" * 74)
+        spread = ext.groupby("group_id").published_split.nunique()
+        n_span = int((spread > 1).sum())
+        span_ids = set(spread[spread > 1].index)
+        n_imgs = int(ext.group_id.isin(span_ids).sum())
+        print(f"  near-duplicate groups spanning more than one partition: "
+              f"{n_span} / {n_groups} ({100 * n_span / n_groups:.1f}%)")
+        print(f"  images involved: {n_imgs} ({100 * n_imgs / n_raw:.1f}%)")
+
+        te = ext[ext.published_split == "test"]
+        if len(te):
+            tr_groups = set(ext[ext.published_split != "test"].group_id)
+            n_bad = int(te.group_id.isin(tr_groups).sum())
+            print(f"  test images with a near-duplicate in train or val: "
+                  f"{n_bad} / {len(te)} ({100 * n_bad / len(te):.1f}%)")
+        if n_span:
+            print("  -> the published split is not free of near-duplicates. "
+                  "This does not\n     affect our use of the data, since we "
+                  "never train on it, but it does\n     bear on results others "
+                  "have reported using this split.")
+        else:
+            print("  -> no near-duplicate group straddles the published "
+                  "partitions.")
+        split_report = {"groups_spanning_splits": n_span,
+                        "images_involved": n_imgs,
+                        "test_images_with_sibling": int(n_bad) if len(te) else None}
+
+    # -- overlap with our data, one scope at a time ---------------------------
     results, per_scope = {}, {}
     for scope in ["trained", "sources", "composite"]:
         dev = load_scope(scope)
         if not len(dev):
-            print(f"\n  scope '{scope}': no development images, skipped")
             continue
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 74)
         print(f"Scope '{scope}': {len(dev)} development images")
-        print("=" * 70)
-
+        print("=" * 74)
         bi, bd = dual_nearest(ph, dh, hex_to_packed(dev.phash),
                               hex_to_packed(dev.dhash))
         hit = bd <= a.threshold
@@ -280,156 +316,149 @@ def main() -> None:
         ext[f"{scope}_overlap"] = hit
 
         n_exact = len(set(ext.sha256) & set(dev.sha256[dev.sha256 != ""]))
-        # A group is contaminated if ANY member matches: the others are
-        # re-encodings of the same scan.
         gflag = ext.groupby("group_id")[f"{scope}_overlap"].any()
         g_hit = int(gflag.sum())
-
         print(f"  byte-identical matches: {n_exact}")
         print(f"  images at dual-hash <= {a.threshold}: {int(hit.sum())} / "
               f"{n_raw} ({100 * hit.mean():.1f}%)")
         print(f"  GROUPS contaminated: {g_hit} / {n_groups} "
               f"({100 * g_hit / n_groups:.1f}%)")
-        print(f"  minimum distance: {int(bd.min())}")
+        print(f"  minimum distance observed: {int(bd.min())}")
 
-        tbl = pd.crosstab(ext.label, ext[f"{scope}_overlap"])
-        tbl.columns = [str(c) for c in tbl.columns]
-        if "True" in tbl:
-            tbl["rate_%"] = (100 * tbl["True"] / tbl.sum(axis=1)).round(1)
-        print("\n  by class:")
-        print(tbl.to_string())
+        print("\n  distance distribution (first 16 bins):")
+        hist = pd.Series(bd).value_counts().sort_index()
+        mx = hist.max()
+        for dval, n in hist.head(16).items():
+            print(f"    {dval:3d} | {n:5d} {'#' * min(52, int(52 * n / mx))}")
+
+        print("\n  overlap by class and published partition:")
+        print(pd.crosstab([ext.label, ext.published_split],
+                          ext[f"{scope}_overlap"]).to_string())
 
         if hit.any():
             print("\n  matched images by external class and development source:")
             print(pd.crosstab(ext.label[hit],
                               ext[f"{scope}_match_source"][hit]).to_string())
-            print("\n  label agreement of matched pairs:")
             agree = (ext.label[hit] == ext[f"{scope}_match_class"][hit]).mean()
-            print(f"    {100 * agree:.1f}% of matches share their diagnostic "
-                  f"label\n    (random pairing would give roughly "
-                  f"{100 / max(ext.label.nunique(), 1):.0f}%)")
+            print(f"\n  {100 * agree:.1f}% of matched pairs share a diagnostic "
+                  f"label (chance ~{100 / max(ext.label.nunique(), 1):.0f}%)")
 
         results[scope] = {
-            "development_images": len(dev),
-            "byte_identical": n_exact,
-            "images_matched": int(hit.sum()),
-            "image_rate": float(hit.mean()),
+            "development_images": len(dev), "byte_identical": n_exact,
+            "images_matched": int(hit.sum()), "image_rate": float(hit.mean()),
             "groups_contaminated": g_hit,
             "group_rate": float(g_hit / n_groups),
-            "min_distance": int(bd.min()),
-            "per_class": tbl.to_dict(),
-        }
+            "min_distance": int(bd.min())}
         per_scope[scope] = gflag
 
     # -- SSIM confirmation -----------------------------------------------------
-    # The scope that matters for independence is 'sources'; confirm there.
-    conf_scope = "sources" if "sources" in results else next(iter(results), None)
-    if a.ssim_sample and conf_scope:
-        hit_idx = np.where(ext[f"{conf_scope}_overlap"].to_numpy())[0]
-        if len(hit_idx):
+    conf = "sources" if "sources" in results else next(iter(results), None)
+    if a.ssim_sample and conf:
+        idx = np.where(ext[f"{conf}_overlap"].to_numpy())[0]
+        if len(idx):
             rng = np.random.default_rng(a.seed)
-            take = rng.choice(hit_idx, min(a.ssim_sample, len(hit_idx)),
-                              replace=False)
-            print("\n" + "=" * 70)
+            take = rng.choice(idx, min(a.ssim_sample, len(idx)), replace=False)
+            print("\n" + "=" * 74)
             print(f"SSIM confirmation on {len(take)} matched pairs "
-                  f"(scope '{conf_scope}')")
-            print("=" * 70)
-            vals, dists = [], []
+                  f"(scope '{conf}')")
+            print("=" * 74)
+            v, d = [], []
             for i in tqdm(take, unit="pair"):
                 A = load_grey(ext.path.iloc[i])
-                B = load_grey(ext[f"{conf_scope}_match_path"].iloc[i])
+                B = load_grey(ext[f"{conf}_match_path"].iloc[i])
                 if A is None or B is None:
                     continue
-                vals.append(ssim(A, B, data_range=255.0))
-                dists.append(int(ext[f"{conf_scope}_distance"].iloc[i]))
-            v, d = np.array(vals), np.array(dists)
-            print(f"  SSIM  median {np.median(v):.3f}   "
-                  f"mean {v.mean():.3f}   min {v.min():.3f}")
-            for lo, hi in [(0.0, 0.5), (0.5, 0.8), (0.8, 0.9), (0.9, 0.95),
-                           (0.95, 1.01)]:
+                v.append(ssim(A, B, data_range=255.0))
+                d.append(int(ext[f"{conf}_distance"].iloc[i]))
+            v, d = np.array(v), np.array(d)
+            print(f"  SSIM median {np.median(v):.3f}  mean {v.mean():.3f}  "
+                  f"min {v.min():.3f}")
+            for lo, hi in [(0, .5), (.5, .8), (.8, .9), (.9, .95), (.95, 1.01)]:
                 m = (v >= lo) & (v < hi)
                 if m.sum():
                     print(f"    SSIM [{lo:.2f}, {hi:.2f}): {int(m.sum()):4d} "
                           f"pairs, mean hash distance {d[m].mean():.1f}")
-            results["ssim"] = {"scope": conf_scope, "n": int(len(v)),
+            print(f"\n  {100 * (v >= 0.95).mean():.1f}% of pairs reach "
+                  f"SSIM >= 0.95. Hash distance and SSIM are\n  independent "
+                  f"measures; their agreement is what makes the claim hold.")
+            results["ssim"] = {"scope": conf, "n": int(len(v)),
                                "median": float(np.median(v)),
-                               "mean": float(v.mean()),
                                "min": float(v.min()),
-                               "frac_above_0.95": float((v >= 0.95).mean()),
-                               "frac_above_0.90": float((v >= 0.90).mean())}
-            print(f"\n  {100 * (v >= 0.95).mean():.1f}% of matched pairs have "
-                  f"SSIM >= 0.95.")
-            print("  Hash distance and SSIM are independent measures; agreement")
-            print("  between them is what makes the overlap claim defensible.")
+                               "frac_above_0.95": float((v >= 0.95).mean())}
+        else:
+            print("\n  no matched pairs to confirm with SSIM.")
 
-    # -- what a decontaminated cohort would look like --------------------------
+    # -- what would remain -----------------------------------------------------
     if "sources" in per_scope:
-        keep_groups = set(per_scope["sources"][~per_scope["sources"]].index)
-        kept = ext[ext.group_id.isin(keep_groups)]
-        print("\n" + "=" * 70)
+        keep = set(per_scope["sources"][~per_scope["sources"]].index)
+        kept = ext[ext.group_id.isin(keep)]
+        print("\n" + "=" * 74)
         print("Cohort remaining after excluding contaminated groups "
               "(scope 'sources')")
-        print("=" * 70)
-        summary = pd.DataFrame({
-            "distributed": ext.label.value_counts(),
-            "retained": kept.label.value_counts(),
-        }).fillna(0).astype(int)
-        summary["removed"] = summary.distributed - summary.retained
-        summary["retained_%"] = (100 * summary.retained /
-                                 summary.distributed).round(1)
-        print(summary.to_string())
-        empty = summary[summary.retained == 0]
+        print("=" * 74)
+        s = pd.DataFrame({"distributed": ext.label.value_counts(),
+                          "retained": kept.label.value_counts()}
+                         ).fillna(0).astype(int)
+        s["removed"] = s.distributed - s.retained
+        s["retained_%"] = (100 * s.retained / s.distributed).round(1)
+        print(s.to_string())
+        if len(kept) and "test" in set(ext.published_split):
+            print("\n  retained, restricted to the published test partition:")
+            print(kept[kept.published_split == "test"].label
+                  .value_counts().to_string())
         print()
+        empty = s[s.retained == 0]
         if len(empty):
-            print(f"  Classes reduced to zero: {', '.join(empty.index)}.")
-            print("  A four-class external evaluation cannot be constructed at")
-            print("  any filtering level. Report the screening; do not present")
-            print("  the remainder as external validation.")
-        elif summary.retained.sum() < 0.5 * n_raw:
-            print("  More than half the cohort is excluded. The provenance of")
-            print("  what remains is unestablished rather than established:")
+            print(f"  Classes reduced to zero: {', '.join(empty.index)}. A "
+                  f"four-class external\n  evaluation cannot be constructed at "
+                  f"any filtering level.")
+        elif s.retained.sum() < 0.5 * n_raw:
+            print("  More than half the cohort is excluded. What remains is of")
+            print("  unestablished rather than established provenance:")
             print("  perceptual hashing finds detectable reuse, not all reuse.")
+        elif results.get("sources", {}).get("group_rate", 1) < 0.01:
+            print("  Contamination is negligible. This cohort is a defensible")
+            print("  external test set. Lock the protocol and the model before")
+            print("  running inference, and report the screening alongside it.")
         else:
             print("  A decontaminated cohort is available. State the exclusion")
-            print("  counts and treat it as a secondary cross-dataset analysis,")
-            print("  not a fully independent external cohort.")
-        results["retained_cohort"] = summary.to_dict()
+            print("  counts and describe it as a secondary cross-dataset")
+            print("  analysis, not a fully independent external cohort.")
+        results["retained_cohort"] = s.to_dict()
 
-    if a.montage and conf_scope:
-        write_montages(ext, a.name, conf_scope, a.montage)
+    if a.montage and conf:
+        write_montages(ext, a.name, conf, a.montage)
 
     ext.to_csv(EXTERNAL / f"{a.name}_manifest.csv", index=False)
-    report = {"name": a.name, "root": str(a.root),
-              "files_distributed": n_raw,
-              "published_per_class": a.published_per_class,
-              "class_counts_as_distributed": ext.label.value_counts().to_dict(),
-              "exact_duplicate_files": int(len(dup_exact)),
-              "exact_duplicate_groups": int(n_exact_groups),
-              "near_duplicate_groups": int(n_groups),
-              "overlap_threshold": a.threshold,
-              "scopes": results}
-    (EXTERNAL / f"{a.name}_overlap_report.json").write_text(
-        json.dumps(report, indent=2, default=str))
+    (EXTERNAL / f"{a.name}_overlap_report.json").write_text(json.dumps({
+        "name": a.name, "root": str(a.root),
+        "restricted_split": a.restrict_split,
+        "files": n_raw,
+        "class_by_split": pd.crosstab(ext.label,
+                                      ext.published_split).to_dict(),
+        "exact_duplicate_files": int(len(dup_exact)),
+        "near_duplicate_groups": int(n_groups),
+        "published_split_integrity": split_report,
+        "overlap_threshold": a.threshold,
+        "scopes": results}, indent=2, default=str))
     print(f"\n  wrote {EXTERNAL / f'{a.name}_manifest.csv'}")
     print(f"  wrote {EXTERNAL / f'{a.name}_overlap_report.json'}")
 
 
-def write_montages(ext: pd.DataFrame, name: str, scope: str, n: int) -> None:
-    """Closest pairs, stratified over distance, so the judgement is not made
-    only on the easiest examples."""
+def write_montages(ext, name, scope, n, T=240):
     d = EXTERNAL / f"{name}_pairs_{scope}"
-    d.mkdir(parents=True, exist_ok=True)
-    T = 240
     hit = ext[ext[f"{scope}_overlap"]]
     if not len(hit):
+        print("\n  no matched pairs; no montages written.")
         return
-    per_bucket = max(1, n // 3)
+    d.mkdir(parents=True, exist_ok=True)
+    per = max(1, n // 3)
     picks = []
     for lo, hi in [(0, 0), (1, 2), (3, 99)]:
         b = hit[(hit[f"{scope}_distance"] >= lo) &
                 (hit[f"{scope}_distance"] <= hi)]
         if len(b):
-            picks.append(b.sample(min(per_bucket, len(b)), random_state=0))
+            picks.append(b.sample(min(per, len(b)), random_state=0))
     for rank, (_, r) in enumerate(pd.concat(picks).iterrows(), 1):
         sheet = Image.new("RGB", (T * 2, T), "black")
         for k, p in enumerate([r.path, r[f"{scope}_match_path"]]):
