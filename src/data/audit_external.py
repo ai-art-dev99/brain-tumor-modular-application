@@ -50,8 +50,8 @@ warnings.filterwarnings("ignore")
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 
 import imagehash
 import numpy as np
@@ -128,9 +128,12 @@ class DSU:
 def normalise_class(path: Path) -> str:
     for part in reversed(path.parts):
         k = part.strip().lower().replace(" ", "_").replace("-", "_")
-        # PMRAM prefixes its class folders with the image size, e.g.
-        # "512Pituitary"; strip any leading digits before matching.
-        k = re.sub(r"^\d+", "", k)
+        # Some redistributions prefix class folders with the image size, e.g.
+        # PMRAM's "512Glioma" / "512Normal". Strip a leading run of digits
+        # before matching; without this every image falls through to "unknown"
+        # and the class counts, grouping and per-class overlap figures are all
+        # computed on nothing.
+        k = re.sub(r"^\d+[_\-]?", "", k)
         if k in CLASS_ALIASES:
             return CLASS_ALIASES[k]
     return "unknown"
