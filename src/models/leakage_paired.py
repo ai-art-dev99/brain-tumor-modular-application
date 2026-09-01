@@ -68,7 +68,8 @@ from torchvision import transforms
 
 from train_eval import fit_tuned
 
-SPLITS = Path("/workspace/data/manifest/splits")
+MANIFEST = Path("/workspace/data/manifest")
+SPLITS = MANIFEST / "splits"
 RUNS = Path("/workspace/outputs/runs")
 OUT = Path("/workspace/outputs/external")
 
@@ -100,6 +101,54 @@ def forward_all(model, paths, tf, device, n_classes, dim, bs, workers):
     return lg, ft
 
 
+POPCOUNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+def _packed(series) -> np.ndarray:
+    return np.array([np.frombuffer(bytes.fromhex(h), dtype=np.uint8)
+                     for h in series], dtype=np.uint8)
+
+
+def exposure_matrix(ext: pd.DataFrame, dev: pd.DataFrame, manifest_dir: Path,
+                    threshold: int, n_folds: int) -> np.ndarray:
+    """
+    (n_folds, n_images) boolean: did fold k's training data contain ANY image
+    within `threshold` of this external image?
+
+    Using only the single nearest match, as an earlier version did, is wrong
+    when an external image matches development images sitting in different
+    folds: the backbone called "unexposed" may still have been fitted on a
+    different counterpart. That error biases the contrast toward zero, so it
+    understates rather than inflates the effect -- but it is still an error.
+    """
+    files = pd.read_csv(manifest_dir / "files_index.csv")
+    fig = pd.read_csv(manifest_dir / "figshare_index.csv")
+    pool = pd.concat([
+        files[["path", "phash", "dhash"]],
+        pd.DataFrame({"path": fig.render_path, "phash": fig.phash,
+                      "dhash": fig.dhash})], ignore_index=True)
+    d = dev.merge(pool, on="path", how="left")
+    if d.phash.isna().any():
+        raise SystemExit(f"{int(d.phash.isna().sum())} development images have "
+                         f"no stored hash; rebuild the manifest indices.")
+
+    ep, ed = _packed(ext.phash), _packed(ext.dhash)
+    dp, dd = _packed(d.phash), _packed(d.dhash)
+    dev_fold = d.outer_fold.to_numpy()
+
+    exposed = np.zeros((n_folds, len(ext)), dtype=bool)
+    for s0 in range(0, len(ext), 256):
+        e0 = min(s0 + 256, len(ext))
+        m = np.maximum(
+            POPCOUNT[ep[s0:e0, None, :] ^ dp[None, :, :]].sum(axis=2),
+            POPCOUNT[ed[s0:e0, None, :] ^ dd[None, :, :]].sum(axis=2)
+        ) <= threshold
+        for k in range(n_folds):
+            # fold k trains on everything outside fold k
+            exposed[k, s0:e0] = m[:, dev_fold != k].any(axis=1)
+    return exposed
+
+
 def paired_bootstrap(seen, unseen, n=4000, seed=42, alpha=0.05):
     """
     Bootstrap the difference in accuracy between models that saw an image's
@@ -112,8 +161,12 @@ def paired_bootstrap(seen, unseen, n=4000, seed=42, alpha=0.05):
     draws = np.array([d[rng.integers(0, len(d), len(d))].mean()
                       for _ in range(n)])
     lo, hi = np.percentile(draws, [100 * alpha / 2, 100 * (1 - alpha / 2)])
-    p = 2 * min((draws <= 0).mean(), (draws >= 0).mean())
-    return float(d.mean()), float(lo), float(hi), float(min(p, 1.0))
+    # (extreme + 1) / (n + 1): a bootstrap of n resamples cannot resolve a
+    # p-value below 1/(n+1), and printing 0.0000 asserts more than the
+    # procedure can support.
+    tail = min(int((draws <= 0).sum()), int((draws >= 0).sum()))
+    p = min(1.0, 2.0 * (tail + 1) / (n + 1))
+    return float(d.mean()), float(lo), float(hi), float(p)
 
 
 def main() -> None:
@@ -127,6 +180,9 @@ def main() -> None:
     ap.add_argument("--heads", nargs="*", default=["svm", "logreg"])
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--match-threshold", type=int, default=2,
+                    help="dual-hash distance defining a counterpart; keep at "
+                         "the value calibrated on the development data")
     ap.add_argument("--bootstrap", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--control", action="store_true",
@@ -149,6 +205,7 @@ def main() -> None:
     if a.split != "all" and "published_split" in ext.columns:
         ext = ext[ext.published_split == a.split]
 
+    n_folds = dev.outer_fold.nunique()
     dropped = 0
     if a.control:
         # Non-overlapping images have no counterpart, so the fold index is
@@ -162,10 +219,11 @@ def main() -> None:
         if not len(ext):
             raise SystemExit("no non-overlapping images available for the control")
         rng = np.random.default_rng(a.seed)
-        ext["counterpart_fold"] = rng.integers(0, dev.outer_fold.nunique(),
-                                               len(ext))
-        ext["trained_match_path"] = ""
-        ext["trained_distance"] = -1
+        # One randomly chosen fold is labelled unexposed, matching the most
+        # common structure of the real analysis.
+        exposed = np.ones((n_folds, len(ext)), dtype=bool)
+        exposed[rng.integers(0, n_folds, len(ext)), np.arange(len(ext))] = False
+        ext["n_exposed_folds"] = exposed.sum(0)
     else:
         ext = ext[ext.trained_overlap.astype(bool)].reset_index(drop=True)
         if not len(ext):
@@ -173,20 +231,24 @@ def main() -> None:
         # Folds are group-disjoint, so the unit held out is the counterpart's
         # whole leakage-control group, not a single image: around 16 images for
         # glioma, around 2 for no-tumour. Describe it that way when reporting.
-        ext["counterpart_fold"] = ext.trained_match_path.map(fold_of_path)
-        dropped = int(ext.counterpart_fold.isna().sum())
-        ext = ext.dropna(subset=["counterpart_fold"]).reset_index(drop=True)
-    ext["counterpart_fold"] = ext.counterpart_fold.astype(int)
+        exposed = exposure_matrix(ext, dev, MANIFEST, a.match_threshold,
+                                  n_folds)
+        # An image whose counterparts appear in every fold's training data has
+        # no unexposed backbone and cannot serve as its own control.
+        usable = (~exposed).any(axis=0) & exposed.any(axis=0)
+        dropped = int((~usable).sum())
+        ext = ext[usable].reset_index(drop=True)
+        exposed = exposed[:, usable]
+        ext["n_exposed_folds"] = exposed.sum(0)
 
-    n_folds = dev.outer_fold.nunique()
     mode = "NEGATIVE CONTROL" if a.control else "paired leakage test"
     print(f"==> {mode}: {len(ext)} images"
           f"{f' ({dropped} dropped: counterpart not in the split file)' if dropped else ''}")
     if a.control:
         print("  These images do NOT overlap the development repositories, and")
         print("  the fold labels are random. The expected difference is zero.")
-    print("\n  counterpart held out by fold:")
-    print(ext.counterpart_fold.value_counts().sort_index().to_string())
+    print("\n  backbones exposed to a counterpart, per image:")
+    print(ext.n_exposed_folds.value_counts().sort_index().to_string())
     print("\n  by class:")
     print(ext.label.value_counts().to_string())
     if a.control:
@@ -254,9 +316,10 @@ def main() -> None:
         torch.cuda.empty_cache()
 
     # -- the paired contrast ---------------------------------------------------
-    kstar = ext.counterpart_fold.to_numpy()
-    rows = np.arange(len(ext))
-    p_floor = 1.0 / a.bootstrap
+    with_m = exposed
+    without_m = ~exposed
+    n_with, n_without = with_m.sum(0), without_m.sum(0)
+    p_floor = 2.0 / (a.bootstrap + 1)
 
     print("\n" + "=" * 78)
     if a.control:
@@ -268,21 +331,23 @@ def main() -> None:
     table = []
     for n in names:
         C = correct[n]
-        unseen = C[kstar, rows].astype(float)          # the one exposed to none
-        mask = np.ones_like(C, dtype=bool)
-        mask[kstar, rows] = False
-        seen = (C * mask).sum(0) / mask.sum(0)         # mean over the other four
+        # Mean correctness over the backbones that were exposed to a
+        # counterpart, against the mean over those that were not. Both are
+        # per-image scalars, so the bootstrap unit below is the image.
+        seen = (C & with_m).sum(0) / n_with
+        unseen = (C & without_m).sum(0) / n_without
 
         d, lo, hi, p = paired_bootstrap(seen, unseen, a.bootstrap, a.seed)
-        cU = conf[n][kstar, rows].mean()
-        cS = (conf[n] * mask).sum(0).sum() / mask.sum()
+        cS = ((conf[n] * with_m).sum(0) / n_with).mean()
+        cU = ((conf[n] * without_m).sum(0) / n_without).mean()
 
-        pstr = f"{p:.4f}" if p >= p_floor else f"<{p_floor:.4f}"
-        print(f"  {n:<12} with counterpart {seen.mean():.4f}   "
-              f"without {unseen.mean():.4f}   "
+        pstr = f"{p:.4f}" if p > p_floor else f"<{p_floor:.4f}"
+        print(f"  {n:<12} exposed {seen.mean():.4f}   "
+              f"unexposed {unseen.mean():.4f}   "
               f"diff {100 * d:+.2f} pp  95% CI "
               f"[{100 * lo:+.2f}, {100 * hi:+.2f}]  p={pstr}")
-        print(f"  {'':<12} mean confidence: with {cS:.3f}  without {cU:.3f}")
+        print(f"  {'':<12} mean confidence: exposed {cS:.3f}  "
+              f"unexposed {cU:.3f}")
         table.append({"model": n, "acc_with_counterpart": float(seen.mean()),
                       "acc_without_counterpart": float(unseen.mean()),
                       "diff_pp": 100 * d, "ci_lo_pp": 100 * lo,
@@ -300,8 +365,10 @@ def main() -> None:
     t["p_holm"] = adj
 
     print("\n" + t.round(4).to_string(index=False))
-    print(f"\n  p-values are floored at 1/{a.bootstrap} = {p_floor:.4f}; report")
-    print(f"  smaller values as p < {p_floor:.4f} rather than as zero.")
+    print(f"\n  p-values use (extreme + 1) / (resamples + 1), so the smallest")
+    print(f"  reportable value with {a.bootstrap} resamples is "
+          f"{p_floor:.5f}. Write p < {p_floor:.4f},")
+    print(f"  never p = 0. Holm adjustment is applied to these finite values.")
     print("\n  Reading this result:")
     if a.control:
         print("   - An interval spanning zero is the required outcome. It shows")
@@ -326,21 +393,19 @@ def main() -> None:
                  else f"paired_leakage_{a.split}")
     out.mkdir(parents=True, exist_ok=True)
     t.to_csv(out / "paired_contrast.csv", index=False)
-    pd.DataFrame({"path": ext.path, "label": y,
-                  "counterpart_fold": kstar,
-                  "counterpart_path": ext.trained_match_path,
-                  "counterpart_distance": ext.trained_distance,
-                  **{f"correct_{n}_without": correct[n][kstar, rows]
-                     for n in names},
-                  **{f"correct_{n}_with_mean":
-                     (correct[n] * (np.ones_like(correct[n], bool)))
-                     .sum(0) / n_folds for n in names}}
-                 ).to_csv(out / "per_image.csv", index=False)
+    per_image = {"path": ext.path, "label": y,
+                 "n_exposed_folds": n_with, "n_unexposed_folds": n_without}
+    for n in names:
+        per_image[f"{n}_acc_exposed"] = (correct[n] & with_m).sum(0) / n_with
+        per_image[f"{n}_acc_unexposed"] = (correct[n] & without_m).sum(0) / n_without
+    pd.DataFrame(per_image).to_csv(out / "per_image.csv", index=False)
     (out / "summary.json").write_text(json.dumps({
         "run": a.run, "manifest": a.manifest, "partition": a.split,
         "mode": "negative_control" if a.control else "paired_leakage_test",
         "n_images": len(ext), "dropped": dropped, "n_folds": n_folds,
         "bootstrap": a.bootstrap, "p_floor": p_floor,
+        "match_threshold": a.match_threshold,
+        "exposed_fold_counts": ext.n_exposed_folds.value_counts().to_dict(),
         "class_counts": ext.label.value_counts().to_dict(),
         "results": table}, indent=2, default=str))
     print(f"\n  wrote {out}/")
