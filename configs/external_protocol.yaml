@@ -1,0 +1,10 @@
+# configs/external_protocol.yaml
+external_dataset: pmram (Mendeley m7w55sw88b), raw subset only, 400/class
+models_evaluated: [cnn, cnn_svm]      # prespecified by the editor's point 8
+ensembling: mean of softmax/posterior over the five outer-fold backbones
+             from run main_finetuned_v2
+resampling_unit: pseudo-patient clusters from audit_external (dual hash <= 2)
+primary_metric: balanced accuracy
+reported: accuracy, balanced accuracy, macro F1, per-class metrics, macro AUC,
+          confusion counts, Brier, ECE, all with 95% group bootstrap CI
+runs_permitted: 1
