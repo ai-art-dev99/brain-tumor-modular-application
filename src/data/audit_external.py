@@ -44,10 +44,14 @@ Usage
 
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore")
+
 import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import imagehash
 import numpy as np
@@ -124,6 +128,9 @@ class DSU:
 def normalise_class(path: Path) -> str:
     for part in reversed(path.parts):
         k = part.strip().lower().replace(" ", "_").replace("-", "_")
+        # PMRAM prefixes its class folders with the image size, e.g.
+        # "512Pituitary"; strip any leading digits before matching.
+        k = re.sub(r"^\d+", "", k)
         if k in CLASS_ALIASES:
             return CLASS_ALIASES[k]
     return "unknown"
