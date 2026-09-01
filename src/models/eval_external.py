@@ -113,6 +113,12 @@ def forward_all(model, paths, tf, device, n_classes, dim, bs, workers):
 # Statistics
 # =============================================================================
 
+def fmt_p(p: float, n_boot: int) -> str:
+    """A bootstrap cannot resolve p below 1/n; printing 0.0000 overstates it."""
+    floor = 1.0 / n_boot
+    return f"{p:.4f}" if p >= floor else f"<{floor:.4f}"
+
+
 def balanced_acc(y, p, labels) -> float:
     return float(recall_score(y, p, labels=labels, average="macro",
                               zero_division=0))
@@ -213,6 +219,14 @@ def main() -> None:
     print(pd.crosstab(ext.label, ext.stratum, margins=True).to_string())
     print(f"\n  strict_clean (nearest source distance >= {STRICT_CLEAN_MIN}): "
           f"{int(strict.sum())}")
+    so = ext.label[stratum == "source_only"]
+    if len(so) and so.nunique() < len(labels):
+        print(f"\n  NOTE: the source_only stratum contains only "
+              f"{', '.join(sorted(so.unique()))}.")
+        print("  Balanced accuracy over the full label set assigns zero recall")
+        print("  to absent classes, so its value is not comparable with the")
+        print("  four-class strata. Report it descriptively, per class, and")
+        print("  build no claim on it.")
     print("\n  Class mixture differs between strata, so balanced accuracy is")
     print("  the primary metric and per-class gaps are reported individually.")
 
@@ -226,8 +240,11 @@ def main() -> None:
         for lo, hi in [(3, 5), (6, 11), (12, 15), (16, 99)]:
             n = int(((cd >= lo) & (cd <= hi)).sum())
             print(f"    {lo:2d}-{hi:<3d}: {n:5d} ({100 * n / len(cd):5.1f}%)")
-        print("  If almost all clean images sit at 12 or beyond, they are not")
-        print("  near-misses of matching and the selection objection weakens.")
+        far = int((cd >= STRICT_CLEAN_MIN).sum())
+        print(f"  {100 * far / len(cd):.1f}% of clean images sit at "
+              f"{STRICT_CLEAN_MIN} bits or beyond. The larger that share,")
+        print("  the weaker the objection that they are merely near-misses of")
+        print("  matching. Quote the percentage, not an impression of it.")
 
     # -- inference ------------------------------------------------------------
     tmp = timm.create_model("efficientnet_b0", pretrained=False, num_classes=0)
@@ -315,6 +332,18 @@ def main() -> None:
                   f"conf {conf.mean():.3f}  ECE "
                   f"{mb.get('ece', float('nan')):.3f}")
 
+        # post-hoc contrast against the strictly separated subset
+        if {"direct", "strict_clean"} <= set(entry):
+            A, S = masks["direct"], masks["strict_clean"]
+            d2, lo2, hi2, p2 = stratified_delta(y[A], pr[A], y[S], pr[S],
+                                                labels, a.bootstrap, a.seed)
+            entry["delta_direct_minus_strict_clean"] = {
+                "balanced_accuracy_diff": d2, "ci95": [lo2, hi2], "p": p2,
+                "prespecified": False}
+            print(f"  {n:<12} {'DELTA(post)':<13} direct - strict_clean: "
+                  f"{100 * d2:+.2f} pp  95% CI [{100 * lo2:+.2f}, "
+                  f"{100 * hi2:+.2f}]  p={fmt_p(p2, a.bootstrap)}")
+
         # primary contrast
         if {"direct", "clean"} <= set(entry):
             A, B = masks["direct"], masks["clean"]
@@ -324,14 +353,20 @@ def main() -> None:
                 "balanced_accuracy_diff": d, "ci95": [lo, hi], "p": p}
             print(f"  {n:<12} {'DELTA':<13} direct - clean: "
                   f"{100 * d:+.2f} pp  95% CI [{100 * lo:+.2f}, {100 * hi:+.2f}]"
-                  f"  p={p:.4f}")
+                  f"  p={fmt_p(p, a.bootstrap)}")
             table.append({"model": n, "delta_pp": 100 * d,
                           "ci_lo_pp": 100 * lo, "ci_hi_pp": 100 * hi, "p": p,
                           "direct_BA": entry["direct"]["point"]["balanced_accuracy"],
                           "clean_BA": entry["clean"]["point"]["balanced_accuracy"],
                           "strict_clean_BA":
                               entry.get("strict_clean", {}).get("point", {})
-                              .get("balanced_accuracy", np.nan)})
+                              .get("balanced_accuracy", np.nan),
+                          "delta_strict_pp": 100 * entry.get(
+                              "delta_direct_minus_strict_clean", {}).get(
+                              "balanced_accuracy_diff", np.nan),
+                          "delta_strict_p": entry.get(
+                              "delta_direct_minus_strict_clean", {}).get(
+                              "p", np.nan)})
 
         # per-class recall, the check that class mixture cannot explain the gap
         if {"direct", "clean"} <= set(entry):
@@ -360,6 +395,15 @@ def main() -> None:
     print("Leakage-associated inflation on a third-party release")
     print("=" * 82)
     t = pd.DataFrame(table)
+    # Six models are compared. cnn and cnn_svm are the prespecified pair and
+    # are also quoted unadjusted; the family carries Holm-adjusted values so a
+    # multiplicity objection has an answer.
+    order = np.argsort(t.p.to_numpy())
+    adj, running = np.zeros(len(t)), 0.0
+    for rank, i in enumerate(order):
+        running = min(1.0, max(running, t.p.iloc[i] * (len(t) - rank)))
+        adj[i] = running
+    t["p_holm"] = adj
     print(t.round(4).to_string(index=False))
     print("\n  Same release, same weights, same preprocessing, one run. The gap")
     print("  is leakage-ASSOCIATED inflation: overlap status is not randomly")
