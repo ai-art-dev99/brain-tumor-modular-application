@@ -1,10 +1,108 @@
-# configs/external_protocol.yaml
-external_dataset: pmram (Mendeley m7w55sw88b), raw subset only, 400/class
-models_evaluated: [cnn, cnn_svm]      # prespecified by the editor's point 8
-ensembling: mean of softmax/posterior over the five outer-fold backbones
-             from run main_finetuned_v2
-resampling_unit: pseudo-patient clusters from audit_external (dual hash <= 2)
-primary_metric: balanced accuracy
-reported: accuracy, balanced accuracy, macro F1, per-class metrics, macro AUC,
-          confusion counts, Brier, ECE, all with 95% group bootstrap CI
-runs_permitted: 1
+# =============================================================================
+# External evaluation protocol
+#
+# COMMIT THIS FILE BEFORE RUNNING eval_external.py FOR THE FIRST TIME.
+# The commit timestamp is what evidences that nothing below was chosen after
+# seeing the numbers. If any field changes afterwards, say so in the paper and
+# give the reason.
+# =============================================================================
+
+cohort:
+  name: bdneuro_v7
+  source: "Mendeley Data, DOI record zwr4ntf94j, version 7"
+  downloaded: "FILL IN THE DATE"      # this record has been revised; the
+                                      # version and date are part of the method
+  files_on_disk: 5944
+  non_study_files_excluded: 3         # images outside any class folder
+  analytic_total: 5941
+  partition_evaluated: test           # publisher-defined; 889 images
+  rationale: >
+    The publisher's own test partition is used rather than a subset chosen by
+    us, because it was fixed before we saw the data and removes a degree of
+    post-hoc freedom. The train and validation partitions are not evaluated.
+
+contamination_screening:
+  criterion: "max(pHash, dHash) Hamming distance <= 2 against the source
+              repositories (Figshare, SARTAJ, BR35H), pre-deduplication"
+  calibration: >
+    The threshold is the one calibrated on the development data, where the
+    glioma class -- drawn from a single source and consisting of distinct
+    consecutive slices -- served as a negative control and lost 0.6% of its
+    images at this setting.
+  unit: "whole near-duplicate group excluded if any member matches"
+  confirmation: "SSIM on a common 256x256 grid for a random sample of matches"
+  result_recorded_before_inference: true
+
+what_is_evaluated:
+  models: [cnn, cnn_svm, cnn_knn, cnn_rf, cnn_mlp, cnn_logreg]
+  source_run: main_finetuned_v2
+  fold_combination: "mean posterior over the five outer-fold backbones"
+  head_fitting: >
+    Each fold's classical head is refitted on that fold's training features
+    with the same inner-fold grid search used internally. No hyperparameter,
+    threshold or preprocessing choice is made using this cohort.
+  tuning_permitted: none
+  runs_permitted: 1
+
+primary_analysis:
+  design: >
+    One published test partition, one set of frozen models, one inference run.
+    Images are stratified by their relationship to the development data:
+      direct        matches the 3,813 images the models were fitted on
+      source_only   matches the source repositories but not the fitted set
+      clean         no match to the source repositories at distance <= 2
+      strict_clean  a subset of clean at nearest distance >= 12
+  question: >
+    Does the model score higher on external images related to our development
+    data than on those that are not, holding publisher, preprocessing, weights
+    and inference code constant?
+  confirmatory_contrast: "direct versus clean"
+  primary_metric: balanced accuracy
+  why_not_accuracy: >
+    Class mixture differs between strata, so plain accuracy would absorb that
+    difference. Per-class recall is reported separately for each stratum; a gap
+    present in all four classes cannot be explained by class composition.
+  statistics: >
+    The strata are different observation sets, so no paired test applies. The
+    difference in balanced accuracy is bootstrapped with resampling within
+    class within stratum, which holds class sizes fixed across iterations.
+  secondary:
+    - "source_only stratum, to see whether it falls between the other two"
+    - "strict_clean, addressing the objection that unmatched images are merely
+       harder-to-match versions of the same scans"
+    - "accuracy, macro F1, per-class metrics, macro ROC-AUC, Brier, ECE,
+       mean confidence"
+  exploratory_and_labelled_as_such:
+    - "balanced accuracy against nearest-distance bins; thresholds there are
+       chosen after seeing the data and are not confirmatory"
+
+interpretation_limits:
+  - >
+    The gap is leakage-ASSOCIATED inflation, not inflation caused by leakage.
+    Overlap status is not randomly assigned and correlates with class, image
+    quality and possibly acquisition subpopulation. The wording in the
+    manuscript follows this distinction.
+  - >
+    Higher confidence on overlapping images is consistent with memorisation
+    but does not on its own establish it.
+
+what_this_is_not:
+  - >
+    This is not independent external validation. The release shares 1,831
+    byte-identical files with our source repositories; the provenance of the
+    unmatched remainder is unestablished rather than established, because
+    perceptual hashing detects the reuse it can see and not all reuse.
+  - >
+    The retained subset must not be described as an independent external
+    cohort, and its accuracy must not be quoted as external validation
+    performance.
+  - >
+    This cohort ships no patient identifiers. Groups are near-duplicate
+    clusters, so intervals remain optimistic if it contains multiple
+    non-duplicate slices per patient.
+
+reporting_commitment: >
+  The result is reported as obtained, including a large drop. A fall in
+  accuracy on unseen third-party data is a finding consistent with the domain
+  shift and acquisition-shortcut results already established, not a failure of
+  the study.
