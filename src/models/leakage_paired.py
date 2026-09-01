@@ -129,6 +129,12 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--bootstrap", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--control", action="store_true",
+                    help="negative control: use NON-overlapping images and "
+                         "assign each a random pseudo-counterpart fold. The "
+                         "contrast must come out null; anything else means the "
+                         "estimator itself is biased and the main result "
+                         "cannot be trusted.")
     a = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,25 +148,58 @@ def main() -> None:
     ext = ext[ext.label.isin(labels)]
     if a.split != "all" and "published_split" in ext.columns:
         ext = ext[ext.published_split == a.split]
-    ext = ext[ext.trained_overlap.astype(bool)].reset_index(drop=True)
-    if not len(ext):
-        raise SystemExit("no images overlap the fitted development set")
 
-    # Which fold held the counterpart out?
-    ext["counterpart_fold"] = ext.trained_match_path.map(fold_of_path)
-    dropped = int(ext.counterpart_fold.isna().sum())
-    ext = ext.dropna(subset=["counterpart_fold"]).reset_index(drop=True)
+    dropped = 0
+    if a.control:
+        # Non-overlapping images have no counterpart, so the fold index is
+        # assigned at random. Every mechanical feature of the analysis is
+        # identical to the real test -- same images scored five times, same
+        # leave-one-fold-out arithmetic, same bootstrap -- but the grouping
+        # variable carries no information. A non-null result here would mean
+        # the contrast is driven by differences between the backbones rather
+        # than by what they were trained on.
+        ext = ext[~ext.sources_overlap.astype(bool)].reset_index(drop=True)
+        if not len(ext):
+            raise SystemExit("no non-overlapping images available for the control")
+        rng = np.random.default_rng(a.seed)
+        ext["counterpart_fold"] = rng.integers(0, dev.outer_fold.nunique(),
+                                               len(ext))
+        ext["trained_match_path"] = ""
+        ext["trained_distance"] = -1
+    else:
+        ext = ext[ext.trained_overlap.astype(bool)].reset_index(drop=True)
+        if not len(ext):
+            raise SystemExit("no images overlap the fitted development set")
+        # Folds are group-disjoint, so the unit held out is the counterpart's
+        # whole leakage-control group, not a single image: around 16 images for
+        # glioma, around 2 for no-tumour. Describe it that way when reporting.
+        ext["counterpart_fold"] = ext.trained_match_path.map(fold_of_path)
+        dropped = int(ext.counterpart_fold.isna().sum())
+        ext = ext.dropna(subset=["counterpart_fold"]).reset_index(drop=True)
     ext["counterpart_fold"] = ext.counterpart_fold.astype(int)
 
     n_folds = dev.outer_fold.nunique()
-    print(f"==> {len(ext)} external images with a counterpart in the fitted set"
+    mode = "NEGATIVE CONTROL" if a.control else "paired leakage test"
+    print(f"==> {mode}: {len(ext)} images"
           f"{f' ({dropped} dropped: counterpart not in the split file)' if dropped else ''}")
+    if a.control:
+        print("  These images do NOT overlap the development repositories, and")
+        print("  the fold labels are random. The expected difference is zero.")
     print("\n  counterpart held out by fold:")
     print(ext.counterpart_fold.value_counts().sort_index().to_string())
     print("\n  by class:")
     print(ext.label.value_counts().to_string())
-    print(f"\n  For each image, {n_folds - 1} backbones were fitted with its "
-          f"counterpart and 1\n  without. The image is its own control.")
+    if a.control:
+        print(f"\n  Each image is scored by all {n_folds} backbones; one is "
+              f"labelled 'held out' at\n  random. No backbone has any "
+              f"privileged relationship to any image here.")
+    else:
+        print(f"\n  For each image, {n_folds - 1} backbones were fitted with "
+              f"its counterpart's\n  leakage-control group present and 1 with "
+              f"that group held out. Because folds\n  are group-disjoint the "
+              f"unit is the group, not a single image. The external\n  image "
+              f"is its own control: class, quality, preprocessing and "
+              f"architecture are\n  identical across the comparison.")
 
     # -- per-fold predictions, kept separate ----------------------------------
     tmp = timm.create_model("efficientnet_b0", pretrained=False, num_classes=0)
@@ -220,7 +259,11 @@ def main() -> None:
     p_floor = 1.0 / a.bootstrap
 
     print("\n" + "=" * 78)
-    print("Within-image paired contrast: counterpart in training vs held out")
+    if a.control:
+        print("NEGATIVE CONTROL: random fold labels on non-overlapping images")
+    else:
+        print("Within-image paired contrast: counterpart group in training vs "
+              "held out")
     print("=" * 78)
     table = []
     for n in names:
@@ -260,16 +303,27 @@ def main() -> None:
     print(f"\n  p-values are floored at 1/{a.bootstrap} = {p_floor:.4f}; report")
     print(f"  smaller values as p < {p_floor:.4f} rather than as zero.")
     print("\n  Reading this result:")
-    print("   - A clear positive difference means the model performs better on")
-    print("     an image when one near-identical counterpart was in its")
-    print("     training data. Since the image is its own control, class,")
-    print("     quality and subpopulation cannot explain it.")
-    print("   - An interval spanning zero means memorisation of individual")
-    print("     counterparts does not account for the stratified gap, which is")
-    print("     then better explained by population differences between")
-    print("     overlapping and non-overlapping images. Report that plainly.")
+    if a.control:
+        print("   - An interval spanning zero is the required outcome. It shows")
+        print("     the leave-one-fold-out arithmetic does not manufacture a")
+        print("     difference on its own, so the effect in the main test is")
+        print("     attributable to training content rather than to the")
+        print("     estimator or to variation between backbones.")
+        print("   - A non-null result here invalidates the main test. Report it")
+        print("     and withdraw the paired analysis rather than explaining it")
+        print("     away.")
+    else:
+        print("   - A clear positive difference means the model performs better")
+        print("     on an image when its near-identical counterpart's group was")
+        print("     in that backbone's training data. The image is its own")
+        print("     control, so class, quality and subpopulation cannot explain")
+        print("     it. Run --control before relying on this.")
+        print("   - An interval spanning zero means memorisation does not")
+        print("     account for the stratified gap, which would then be better")
+        print("     explained by population differences. Report that plainly.")
 
-    out = OUT / f"paired_leakage_{a.split}"
+    out = OUT / (f"paired_control_{a.split}" if a.control
+                 else f"paired_leakage_{a.split}")
     out.mkdir(parents=True, exist_ok=True)
     t.to_csv(out / "paired_contrast.csv", index=False)
     pd.DataFrame({"path": ext.path, "label": y,
@@ -284,6 +338,7 @@ def main() -> None:
                  ).to_csv(out / "per_image.csv", index=False)
     (out / "summary.json").write_text(json.dumps({
         "run": a.run, "manifest": a.manifest, "partition": a.split,
+        "mode": "negative_control" if a.control else "paired_leakage_test",
         "n_images": len(ext), "dropped": dropped, "n_folds": n_folds,
         "bootstrap": a.bootstrap, "p_floor": p_floor,
         "class_counts": ext.label.value_counts().to_dict(),
