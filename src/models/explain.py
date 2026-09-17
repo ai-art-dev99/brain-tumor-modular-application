@@ -48,7 +48,7 @@ Usage
 from __future__ import annotations
 
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 import argparse
 import json
@@ -149,7 +149,7 @@ def deferral(args) -> None:
           f"({preds.group_id.nunique()} units, {len(preds)} images)")
     print("=" * 74)
 
-    cal_rows, curve_rows, rel_rows = [], [], []
+    cal_rows, curve_rows, rel_rows, rc_rows = [], [], [], []
 
     for mdl in models:
         cols = [f"prob_{mdl}_{l}" for l in labels]
@@ -177,7 +177,12 @@ def deferral(args) -> None:
                              "n": n, "mean_confidence": mc, "accuracy": acc})
 
         # -- risk-coverage ----------------------------------------------------
+        # AURC was previously printed and not stored, so it could not be
+        # checked against the manuscript. It is written out now.
         _, _, aurc, oracle = risk_coverage(cg, corr_g)
+        rc_rows.append({"model": mdl, "level": unit, "aurc": aurc,
+                        "oracle_aurc": oracle, "excess_aurc": aurc - oracle,
+                        "n_units": int(len(cg))})
 
         print(f"\n  {mdl}")
         print(f"    calibration  image: ECE {m_img['ece']:.4f}  "
@@ -212,8 +217,10 @@ def deferral(args) -> None:
     pd.DataFrame(cal_rows).to_csv(run_dir / "calibration.csv", index=False)
     pd.DataFrame(curve_rows).to_csv(run_dir / "deferral_curve.csv", index=False)
     pd.DataFrame(rel_rows).to_csv(run_dir / "reliability_bins.csv", index=False)
+    pd.DataFrame(rc_rows).to_csv(run_dir / "risk_coverage.csv", index=False)
 
-    print(f"\n  wrote calibration.csv, deferral_curve.csv, reliability_bins.csv")
+    print(f"\n  wrote calibration.csv, deferral_curve.csv, "
+          f"reliability_bins.csv, risk_coverage.csv")
     print("\n  Reporting notes:")
     print("    - Deferral withholds whole units, so a referred case costs a")
     print("      full examination of radiologist time, not one slice. Report")

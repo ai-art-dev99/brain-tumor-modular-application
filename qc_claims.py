@@ -31,6 +31,9 @@ USAGE
 
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore")
+
 import argparse
 import json
 import re
@@ -101,11 +104,13 @@ def ci(tag: str, model: str, key: str, bound: int) -> float:
     return float(m[f"{key}_ci95"][bound])
 
 
-def comparison(tag: str, a: str, b: str, field_: str) -> float:
+def comparison(tag: str, a: str, b: str, field_: str):
     for c in run_metrics(tag)["comparisons"]:
         if {c["model_a"], c["model_b"]} == {a, b}:
             v = c[field_]
-            # acc_diff is signed by argument order in the stored record
+            if isinstance(v, (list, tuple)):
+                # interval bounds flip with the sign convention
+                return [-v[1], -v[0]] if c["model_a"] != a else list(v)
             if field_ == "acc_diff" and c["model_a"] != a:
                 v = -v
             return float(v)
@@ -146,6 +151,38 @@ def fold_std_range(tag: str) -> tuple[float, float]:
     pf = csv(RUNS / tag / "per_fold.csv")
     sd = pf.groupby("model").accuracy.std()
     return float(sd.min()), float(sd.max())
+
+
+def cal(tag: str, model: str, key: str, level: str = "unit") -> float:
+    """Calibration figures. `level` is 'image' or 'unit'; the unit level is
+    labelled 'group' or 'patient' depending on the configuration, so it is
+    selected by exclusion rather than by name."""
+    d = csv(RUNS / tag / "calibration.csv")
+    d = d[d.level != "image"] if level == "unit" else d[d.level == level]
+    r = d[d.model == model]
+    if not len(r):
+        raise Missing(f"calibration.csv has no {model} at level {level}")
+    return float(r.iloc[0][key])
+
+
+def defer(tag: str, model: str, frac: float, col: str) -> float:
+    d = csv(RUNS / tag / "deferral_curve.csv")
+    r = d[(d.model == model) & (np.isclose(d.defer_frac, frac))]
+    if not len(r):
+        raise Missing(f"deferral_curve.csv has no {model} at defer={frac}")
+    return float(r.iloc[0][col])
+
+
+def aurc(tag: str, model: str) -> float:
+    f = RUNS / tag / "risk_coverage.csv"
+    if not f.exists():
+        raise Missing("risk_coverage.csv not written; re-run explain.py "
+                      "--mode deferral with the patched version")
+    d = csv(f)
+    r = d[d.model == model]
+    if not len(r):
+        raise Missing(f"risk_coverage.csv has no {model}")
+    return float(r.iloc[0]["aurc"])
 
 
 def probe(name: str, key: str) -> float:
@@ -212,13 +249,53 @@ def retained_after(name: str, scope: str) -> pd.DataFrame:
     return d[~flag]
 
 
+RAW_BR35H = Path("/workspace/data/raw/br35h")
+IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+
+def count_images(root: Path, subdir: str) -> int:
+    d = root / subdir
+    if not d.exists():
+        for cand in root.rglob(subdir):
+            if cand.is_dir():
+                d = cand
+                break
+        else:
+            raise Missing(f"{root}/{subdir} not found")
+    return sum(1 for p in d.rglob("*") if p.suffix.lower() in IMG_EXT)
+
+
+def cross_source_clusters() -> int:
+    d = csv(MANIFEST / "dataset_with_duplicates.csv")
+    per = d.groupby("dup_cluster").source.nunique()
+    return int((per > 1).sum())
+
+
+def sartaj_notumor() -> dict:
+    f = csv(MANIFEST / "files_index.csv")
+    sn = f[(f.source == "sartaj") & (f["class"] == "notumor")]
+    br = set(f[(f.source == "br35h")].sha256)
+    uniq = sn.sha256.nunique()
+    return {"n": len(sn), "unique": uniq,
+            "dup_pct": 100 * (1 - uniq / max(len(sn), 1)),
+            "in_br35h": int(sn.sha256.isin(br).sum())}
+
+
 def pub_leak() -> dict:
     """Leakage in the partition distributed with the benchmark, recomputed
     from the provenance manifest rather than quoted from console output."""
     m = csv(MANIFEST / "manifest.csv")
     r = m[m.best_distance <= 4]
-    agree = 100 * (r.label == r.matched_class).mean() \
-        if "matched_class" in r.columns else float("nan")
+    # matched_class is not stored in the manifest, so the recovered label is
+    # joined back from the Figshare index rather than left as NaN, which an
+    # earlier version reported as a passing claim.
+    if "matched_class" in r.columns:
+        agree = 100 * (r.label == r.matched_class).mean()
+    elif "matched_mat" in r.columns:
+        fig = csv(MANIFEST / "figshare_index.csv").set_index("mat_file")["class"]
+        agree = 100 * (r.label == r.matched_mat.map(fig)).mean()
+    else:
+        raise Missing("manifest.csv records neither matched_class nor matched_mat")
     withp = r[r.patient_id.fillna("") != ""]
     spread = withp.groupby("patient_id").orig_split.nunique()
     bad = spread[spread > 1].index
@@ -275,6 +352,9 @@ class Claim:
     # quote. They are checked for resolvability and recorded, but absence from
     # the text is not a failure.
     must_appear: bool = True
+    # Set where zero is a real, expected value rather than a sign that the
+    # artefact has lost the category.
+    zero_ok: bool = False
     aliases: list = field(default_factory=list)   # other renderings that count
 
 
@@ -325,7 +405,7 @@ def build_claims() -> list[Claim]:
                            .groupby("patient_id").outer_fold.nunique() > 1).sum()), i))
     add(Claim("split.grouped.sibling_pct", "3.4",
               lambda: sibling_rate("main"), lambda v: f"{v:.1f}",
-              note="must be 0.0"))
+              note="must be 0.0", zero_ok=True))
 
     # -- headline performance -------------------------------------------------
     for tag, models in [("main_finetuned_v2",
@@ -469,8 +549,21 @@ def build_claims() -> list[Claim]:
                   "label == 'meningioma'").sources_overlap.mean(), pct1))
 
     # -- dataset construction, exclusions and provenance ---------------------
-    add(Claim("ds.curated_total", "3.2", lambda: 6402, i,
-              note="sum of the inclusion rules; see dedup_and_group.py"))
+    add(Claim("ds.curated_total", "3.2",
+              lambda: len(csv(MANIFEST / "dataset_with_duplicates.csv")), thou,
+              note="rows surviving the inclusion rules, before deduplication"))
+    for cls in ["glioma", "meningioma", "pituitary", "notumor"]:
+        add(Claim(f"ds.curated.{cls}", "3.2",
+                  lambda c=cls: int((csv(MANIFEST / "dataset_with_duplicates.csv")
+                                     .label == c).sum()), thou))
+    add(Claim("ds.pid_before_propagation", "3.3",
+              lambda: 100 * len(csv(MANIFEST / "figshare_index.csv")) /
+                      len(csv(MANIFEST / "dataset_with_duplicates.csv")), pct1))
+    add(Claim("ds.pid_after_propagation", "3.3",
+              lambda: 100 * (csv(MANIFEST / "dataset_with_duplicates.csv")
+                             .patient_id.fillna("") != "").mean(), pct1))
+    add(Claim("ds.cross_source_clusters", "3.3",
+              lambda: cross_source_clusters(), thou))
     for src, cls, sec in [("figshare", "glioma", "3.1"),
                           ("figshare", "meningioma", "3.1"),
                           ("figshare", "pituitary", "3.1")]:
@@ -479,13 +572,24 @@ def build_claims() -> list[Claim]:
                                      == c).sum()), thou))
     for src, cls, key in [("sartaj", "glioma", "excl.sartaj_glioma"),
                           ("sartaj", "notumor", "excl.sartaj_notumor"),
-                          ("br35h", "tumour_unspecified", "excl.br35h_yes"),
-                          ("br35h", "unknown", "excl.br35h_maskrcnn"),
-                          ("br35h", "unlabelled", "excl.br35h_pred")]:
+                          ("br35h", "tumour_unspecified", "excl.br35h_yes")]:
         add(Claim(key, "3.2",
                   lambda s_=src, c=cls: int(((csv(MANIFEST / "files_index.csv").source == s_) &
                                              (csv(MANIFEST / "files_index.csv")["class"] == c)).sum()),
                   thou))
+    # The Mask-RCNN and pred directories are excluded at indexing time, so the
+    # index cannot report them. They are counted on disk instead.
+    add(Claim("excl.br35h_maskrcnn", "3.2",
+              lambda: count_images(RAW_BR35H, "Br35H-Mask-RCNN"), thou))
+    add(Claim("excl.br35h_pred", "3.2",
+              lambda: count_images(RAW_BR35H, "pred"), thou))
+    # SARTAJ no-tumour redundancy, quoted in the exclusion table
+    add(Claim("excl.sartaj_notumor_unique", "3.2",
+              lambda: sartaj_notumor()["unique"], i))
+    add(Claim("excl.sartaj_notumor_dup_pct", "3.2",
+              lambda: sartaj_notumor()["dup_pct"], pct1))
+    add(Claim("excl.sartaj_notumor_in_br35h", "3.2",
+              lambda: sartaj_notumor()["in_br35h"], i))
     for src in ["sartaj", "br35h"]:
         add(Claim(f"ds.raw.{src}", "3.1",
                   lambda s_=src: int((csv(MANIFEST / "files_index.csv").source == s_).sum()),
@@ -534,6 +638,60 @@ def build_claims() -> list[Claim]:
     add(Claim("ext.bdneuro.trained_bytes", "4.7",
               lambda: ext_report("bdneuro_v7", "scopes", "trained",
                                  "byte_identical"), i))
+
+    # -- calibration and selective prediction ---------------------------------
+    for m, sec in [("cnn", "4.6"), ("cnn_svm", "4.6"),
+                   ("cnn_logreg", "4.6"), ("cnn_rf", "4.6")]:
+        add(Claim(f"cal.main.{m}.ece", sec,
+                  lambda mm=m: cal("main_finetuned_v2", mm, "ece"), f3))
+    for m in ["cnn", "cnn_svm", "cnn_logreg"]:
+        add(Claim(f"aurc.main.{m}", "4.6",
+                  lambda mm=m: aurc("main_finetuned_v2", mm), f4))
+    # aggregation to the decision unit, with no deferral
+    add(Claim("defer.main.cnn.unit_acc0", "4.6",
+              lambda: defer("main_finetuned_v2", "cnn", 0.0,
+                            "unit_accuracy"), f4))
+    # the operating point quoted in the text
+    add(Claim("defer.fig.cnn_svm.acc0", "4.6",
+              lambda: defer("figshare_finetuned_v2", "cnn_svm", 0.0,
+                            "unit_accuracy"), f3))
+    add(Claim("defer.fig.cnn_svm.acc20", "4.6",
+              lambda: defer("figshare_finetuned_v2", "cnn_svm", 0.20,
+                            "unit_accuracy"), f3))
+    add(Claim("defer.fig.images_transferred", "4.6",
+              lambda: 3038 - defer("figshare_finetuned_v2", "cnn_svm", 0.20,
+                                   "images_kept"), i))
+
+    # -- external label agreement and structural similarity ------------------
+    for name, tag in [("pmram", "ext.pmram"), ("bdneuro_v7", "ext.bdneuro")]:
+        add(Claim(f"{tag}.label_agreement", "4.7",
+                  lambda n=name: 100 * ext_manifest(n)
+                      .query("sources_overlap")
+                      .pipe(lambda d: (d.label == d.sources_match_class).mean()),
+                  lambda v: f"{v:.1f}"))
+        add(Claim(f"{tag}.ssim_median", "4.7",
+                  lambda n=name: ext_report(n, "scopes", "ssim", "median"), f3))
+        add(Claim(f"{tag}.ssim_frac95", "4.7",
+                  lambda n=name: 100 * ext_report(n, "scopes", "ssim",
+                                                  "frac_above_0.95"), pct1))
+    add(Claim("ext.bdneuro.sources_pct", "4.7",
+              lambda: 100 * ext_report("bdneuro_v7", "scopes", "sources",
+                                       "image_rate"), pct1))
+    add(Claim("ext.bdneuro.composite_pct", "4.7",
+              lambda: 100 * ext_report("bdneuro_v7", "scopes", "composite",
+                                       "image_rate"), pct1))
+    add(Claim("ext.bdneuro.trained_pct", "4.7",
+              lambda: 100 * ext_report("bdneuro_v7", "scopes", "trained",
+                                       "image_rate"), pct1))
+
+    # -- comparison interval bounds -------------------------------------------
+    for tag, lbl in [("main_finetuned_v2", "main"),
+                     ("figshare_finetuned_v2", "fig")]:
+        for b, side in [(0, "lo"), (1, "hi")]:
+            add(Claim(f"cmp.{lbl}.ci_{side}_pp", "4.3",
+                      lambda t=tag, bb=b: 100 * abs(
+                          comparison(t, "cnn", "cnn_svm", "acc_diff_ci95")[bb]),
+                      f2))
 
     # -- paired leakage contrast ---------------------------------------------
     add(Claim("paired.n", "4.8",
@@ -673,7 +831,29 @@ def main() -> None:
             failures.append((c, "resolver error", str(e)))
             continue
 
+        # A NaN, a zero count, or a one-character rendering can match almost
+        # any document by accident. Two such claims passed silently in an
+        # earlier run: an exclusion count that had become 0 because the
+        # artefact no longer contained the category, and a label-agreement
+        # figure that resolved to NaN. Both are now refused.
+        try:
+            if value != value:                       # NaN
+                raise Missing("resolved to NaN")
+            if isinstance(value, (int, float)) and float(value) == 0.0 \
+                    and not c.zero_ok:
+                raise Missing("resolved to 0, which usually means the artefact "
+                              "no longer contains this category")
+        except Missing as e:
+            print(f"  SKIP  {c.id:<38} {e}")
+            skip += 1
+            continue
+
         rendered = c.fmt(value)
+        if len(rendered.strip("+-")) < 2:
+            print(f"  SKIP  {c.id:<38} rendering {rendered!r} is too short to "
+                  f"match reliably")
+            skip += 1
+            continue
         covered.add(normalise(rendered))
         covered.add(normalise(rendered.lstrip("+")))
 
