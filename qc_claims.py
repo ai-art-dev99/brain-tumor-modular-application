@@ -142,13 +142,29 @@ def fold_std(tag: str, model: str) -> float:
     return float(pf[pf.model == model].accuracy.std())
 
 
+def fold_std_range(tag: str) -> tuple[float, float]:
+    pf = csv(RUNS / tag / "per_fold.csv")
+    sd = pf.groupby("model").accuracy.std()
+    return float(sd.min()), float(sd.max())
+
+
 def probe(name: str, key: str) -> float:
     return float(js(PROBES / f"{name}.json")[key])
 
 
 def ext_report(name: str, *path):
+    """Read a value from an audit report.
+
+    Reports written by earlier versions of audit_external use a different
+    schema. Rather than silently reading the wrong field, a missing key is
+    raised as Missing so the claim is reported as SKIP and the audit is
+    re-run against the current version.
+    """
     d = js(EXTERNAL / f"{name}_overlap_report.json")
     for k in path:
+        if not isinstance(d, dict) or k not in d:
+            raise Missing(f"{name}_overlap_report.json lacks {'.'.join(path)} "
+                          f"(written by an older audit_external; re-run it)")
         d = d[k]
     return d
 
@@ -191,6 +207,10 @@ class Claim:
     fmt: Callable                # how it must appear
     note: str = ""
     docs: tuple = ("manuscript", "letter")
+    # Some claims exist to pin an artefact value that the documents do not
+    # quote. They are checked for resolvability and recorded, but absence from
+    # the text is not a failure.
+    must_appear: bool = True
     aliases: list = field(default_factory=list)   # other renderings that count
 
 
@@ -257,7 +277,10 @@ def build_claims() -> list[Claim]:
             add(Claim(f"perf.{tag}.{m}.acc", "4.1",
                       lambda t=tag, mm=m: point(t, mm, "accuracy"), f4))
             add(Claim(f"perf.{tag}.{m}.bal", "4.1",
-                      lambda t=tag, mm=m: point(t, mm, "balanced_accuracy"), f4))
+                      lambda t=tag, mm=m: point(t, mm, "balanced_accuracy"), f4,
+                      # Table 7 reports accuracy only for the image-level run,
+                      # so its balanced figures are pinned rather than quoted.
+                      must_appear=(tag != "main_naive_ft_v2")))
 
     for m in ["cnn", "cnn_svm"]:
         for b, lbl in [(0, "lo"), (1, "hi")]:
@@ -275,10 +298,14 @@ def build_claims() -> list[Claim]:
                                       - point("main_finetuned_v2", mm, "accuracy")),
                   f2))
 
-    add(Claim("infl.foldstd.grouped.cnn_svm", "4.2",
-              lambda: fold_std("main_finetuned_v2", "cnn_svm"), f3))
-    add(Claim("infl.foldstd.naive.cnn_svm", "4.2",
-              lambda: fold_std("main_naive_ft_v2", "cnn_svm"), f3))
+    # The manuscript states a range across model configurations, so the claim
+    # must target the range rather than one model.
+    for tag, lbl in [("main_finetuned_v2", "grouped"),
+                     ("main_naive_ft_v2", "naive")]:
+        add(Claim(f"infl.foldstd.{lbl}.min", "4.2",
+                  lambda t=tag: fold_std_range(t)[0], f3))
+        add(Claim(f"infl.foldstd.{lbl}.max", "4.2",
+                  lambda t=tag: fold_std_range(t)[1], f3))
 
     # -- primary comparison ---------------------------------------------------
     add(Claim("cmp.main.diff_pp", "4.3",
@@ -299,6 +326,20 @@ def build_claims() -> list[Claim]:
                              - point("main_finetuned_v2", "cnn",
                                      "balanced_accuracy")), f2,
               note="reported alongside the accuracy difference"))
+
+    # -- per-class results, Table 8 ------------------------------------------
+    for m in ["cnn", "cnn_svm"]:
+        for cls in ["glioma", "meningioma", "notumor", "pituitary"]:
+            add(Claim(f"cls.{m}.{cls}.recall", "4.3",
+                      lambda mm=m, c=cls: point("main_finetuned_v2", mm,
+                                                f"recall::{c}"), f3))
+            add(Claim(f"cls.{m}.{cls}.f1", "4.3",
+                      lambda mm=m, c=cls: point("main_finetuned_v2", mm,
+                                                f"f1::{c}"), f3))
+            for b, lbl in [(0, "lo"), (1, "hi")]:
+                add(Claim(f"cls.{m}.{cls}.recall_{lbl}", "4.3",
+                          lambda mm=m, c=cls, bb=b: ci("main_finetuned_v2", mm,
+                                                       f"recall::{c}", bb), f3))
 
     # -- source probes --------------------------------------------------------
     add(Claim("probe.bg_pair.bal", "4.4",
@@ -330,6 +371,14 @@ def build_claims() -> list[Claim]:
                                  "images_matched"), i))
     add(Claim("ext.bdneuro.files", "4.7",
               lambda: ext_report("bdneuro_v7", "files"), thou))
+    add(Claim("ext.bdneuro.study_images", "4.7",
+              lambda: ext_report("bdneuro_v7", "files")
+                      - sum(v for k, v in ext_report(
+                          "bdneuro_v7", "class_by_split").get("unassigned", {}).items()),
+              thou, note="files minus images outside any class directory"))
+    add(Claim("ext.bdneuro.trained_matched", "4.7",
+              lambda: ext_report("bdneuro_v7", "scopes", "trained",
+                                 "images_matched"), thou))
     add(Claim("ext.bdneuro.sources_matched", "4.7",
               lambda: ext_report("bdneuro_v7", "scopes", "sources",
                                  "images_matched"), thou))
@@ -370,17 +419,55 @@ def build_claims() -> list[Claim]:
 # Document handling
 # =============================================================================
 
+def read_docx(path: Path) -> str:
+    """
+    Extract text from a .docx without external tools.
+
+    A .docx is a zip archive whose text lives in word/document.xml. Word
+    frequently splits a single number across several runs -- 0.94 in one and
+    05 in the next -- so runs within a paragraph are concatenated with no
+    separator and only paragraphs are separated. Joining runs with a space
+    instead would make every such number unfindable, and the check would pass
+    documents it had never actually read.
+
+    Table cells are ordinary paragraphs in the XML, so table contents are
+    included.
+    """
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        names = [n for n in ("word/document.xml",) if n in z.namelist()]
+        if not names:
+            raise Missing(f"{path} contains no word/document.xml")
+        xml = z.read(names[0]).decode("utf-8", "replace")
+
+    paragraphs = []
+    for para in re.findall(r"<w:p[ >].*?</w:p>", xml, flags=re.S):
+        runs = re.findall(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>", para, flags=re.S)
+        if not runs:
+            continue
+        text = "".join(runs)
+        for a, b in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                     ("&quot;", '"'), ("&apos;", "'")]:
+            text = text.replace(a, b)
+        paragraphs.append(text)
+    return "\n".join(paragraphs)
+
+
 def read_doc(path: Path) -> str:
     if not path.exists():
         return ""
     if path.suffix.lower() == ".docx":
         try:
-            return subprocess.run(["pandoc", "-t", "plain", str(path)],
-                                  capture_output=True, text=True,
-                                  check=True).stdout
+            return read_docx(path)
         except Exception as e:
-            print(f"  could not read {path}: {e}")
-            return ""
+            # pandoc is a fallback only; it is not required.
+            try:
+                return subprocess.run(["pandoc", "-t", "plain", str(path)],
+                                      capture_output=True, text=True,
+                                      check=True).stdout
+            except Exception:
+                print(f"  could not read {path}: {e}")
+                return ""
     return path.read_text(encoding="utf-8")
 
 
@@ -449,6 +536,11 @@ def main() -> None:
         rendered = c.fmt(value)
         covered.add(normalise(rendered))
         covered.add(normalise(rendered.lstrip("+")))
+
+        if not c.must_appear:
+            print(f"  note  {c.id:<38} {rendered}  (pinned, not quoted)")
+            ok += 1
+            continue
 
         where = [d for d in c.docs if docs.get(d)]
         found = {d: present(rendered, docs[d]) for d in where}
