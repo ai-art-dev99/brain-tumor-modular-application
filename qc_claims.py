@@ -290,10 +290,10 @@ def pub_leak() -> dict:
     # joined back from the Figshare index rather than left as NaN, which an
     # earlier version reported as a passing claim.
     if "matched_class" in r.columns:
-        agree = 100 * (r.label == r.matched_class).mean()
+        agree = 100 * (r["class"] == r.matched_class).mean()
     elif "matched_mat" in r.columns:
         fig = csv(MANIFEST / "figshare_index.csv").set_index("mat_file")["class"]
-        agree = 100 * (r.label == r.matched_mat.map(fig)).mean()
+        agree = 100 * (r["class"] == r.matched_mat.map(fig)).mean()
     else:
         raise Missing("manifest.csv records neither matched_class nor matched_mat")
     withp = r[r.patient_id.fillna("") != ""]
@@ -778,12 +778,21 @@ def normalise(t: str) -> str:
 
 
 def present(needle: str, hay: str) -> bool:
+    """
+    Substring matching is not sufficient: 0.968 occurs inside 0.9686, so a
+    claim can pass against a different number elsewhere in the document. One
+    real error survived an earlier run that way. The match must therefore not
+    be preceded or followed by another digit, and must not continue into a
+    further decimal place.
+    """
     n = normalise(needle)
-    if n in hay:
-        return True
-    # a leading + is often dropped in prose
-    if n.startswith("+") and n[1:] in hay:
-        return True
+    variants = [n] + ([n[1:]] if n.startswith("+") else [])
+    for v in variants:
+        if not v:
+            continue
+        pat = r"(?<![\d.,])" + re.escape(v) + r"(?![\d])"
+        if re.search(pat, hay):
+            return True
     return False
 
 
