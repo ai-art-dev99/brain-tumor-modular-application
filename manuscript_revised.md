@@ -102,7 +102,7 @@ Within the Figshare collection, the 3,064 slices derive from 233 patients: 89 wi
 | Excluded | n | Reason |
 |---|---|---|
 | SARTAJ glioma | 926 | Documented labelling inconsistency in this subset; gliomas drawn from Figshare instead |
-| SARTAJ no-tumour | 500 | 500 files reduce to 352 unique file hashes (29.6% internally duplicated); 120 are byte-identical to BR35H images |
+| SARTAJ no-tumour | 500 | 500 files reduce to 352 unique file hashes (29.6% internally duplicated); 208 of the files, representing 120 distinct images, are byte-identical to images in BR35H |
 | BR35H `yes` | 1,500 | Tumours of unspecified histology; cannot be assigned to one of the four diagnostic classes |
 | BR35H `Br35H-Mask-RCNN` | 801 | Byte-identical repackaging of the `yes` folder for an object-detection task |
 | BR35H `pred` | 60 | No ground-truth labels |

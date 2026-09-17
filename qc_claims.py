@@ -142,6 +142,15 @@ def sibling_rate(name: str) -> float:
     return 100 * bad / tot
 
 
+def sibling_count(name: str) -> int:
+    d = split(name)
+    n = 0
+    for k in sorted(d.outer_fold.unique()):
+        te = d[d.outer_fold == k]
+        n += int(te.group_id.isin(set(d[d.outer_fold != k].group_id)).sum())
+    return n
+
+
 def fold_std(tag: str, model: str) -> float:
     pf = csv(RUNS / tag / "per_fold.csv")
     return float(pf[pf.model == model].accuracy.std())
@@ -278,7 +287,8 @@ def sartaj_notumor() -> dict:
     uniq = sn.sha256.nunique()
     return {"n": len(sn), "unique": uniq,
             "dup_pct": 100 * (1 - uniq / max(len(sn), 1)),
-            "in_br35h": int(sn.sha256.isin(br).sum())}
+            "in_br35h": int(sn.sha256.isin(br).sum()),
+            "in_br35h_unique": int(sn[sn.sha256.isin(br)].sha256.nunique())}
 
 
 def pub_leak() -> dict:
@@ -289,20 +299,38 @@ def pub_leak() -> dict:
     # matched_class is not stored in the manifest, so the recovered label is
     # joined back from the Figshare index rather than left as NaN, which an
     # earlier version reported as a passing claim.
-    if "matched_class" in r.columns:
-        agree = 100 * (r["class"] == r.matched_class).mean()
-    elif "matched_mat" in r.columns:
+    # Agreement is assessed only over the classes the Figshare collection
+    # contains. It has no no-tumour images, so every no-tumour match is a
+    # mismatch by construction, and including them would conflate a failure of
+    # matching with a disagreement about labels.
+    tumour = ["glioma", "meningioma", "pituitary"]
+    rt = r[r["class"].isin(tumour)]
+    if "matched_class" in rt.columns:
+        agree = 100 * (rt["class"] == rt.matched_class).mean()
+    elif "matched_mat" in rt.columns:
         fig = csv(MANIFEST / "figshare_index.csv").set_index("mat_file")["class"]
-        agree = 100 * (r["class"] == r.matched_mat.map(fig)).mean()
+        agree = 100 * (rt["class"] == rt.matched_mat.map(fig)).mean()
     else:
         raise Missing("manifest.csv records neither matched_class nor matched_mat")
     withp = r[r.patient_id.fillna("") != ""]
     spread = withp.groupby("patient_id").orig_split.nunique()
     bad = spread[spread > 1].index
     return {"matched": len(r), "agreement": agree,
+            "agreement_at_8": agreement_at(m, 8),
             "patients": withp.patient_id.nunique(),
             "spanning": len(bad),
             "images": int(withp.patient_id.isin(bad).sum())}
+
+
+def agreement_at(m: pd.DataFrame, threshold: int) -> float:
+    """Label agreement of provenance matches at a looser threshold, quoted in
+    the Methods to justify the value chosen."""
+    fig = csv(MANIFEST / "figshare_index.csv").set_index("mat_file")["class"]
+    tumour = ["glioma", "meningioma", "pituitary"]
+    r = m[(m.best_distance <= threshold) & (m["class"].isin(tumour))]
+    if "matched_class" in r.columns:
+        return 100 * (r["class"] == r.matched_class).mean()
+    return 100 * (r["class"] == r.matched_mat.map(fig)).mean()
 
 
 def strata() -> dict:
@@ -396,16 +424,46 @@ def build_claims() -> list[Claim]:
                                 dataset()[dataset().label == c].group_id.nunique(),
                   f1))
 
+    for cls in ["glioma", "meningioma", "pituitary", "notumor"]:
+        add(Claim(f"ds.dedup_pct.{cls}", "3.3",
+                  lambda c=cls: 100 * (1 - (dataset().label == c).sum() /
+                                       (csv(MANIFEST / "dataset_with_duplicates.csv")
+                                        .label == c).sum()), pct1))
+    add(Claim("ds.dedup_pct.total", "3.3",
+              lambda: 100 * (1 - len(dataset()) /
+                             len(csv(MANIFEST / "dataset_with_duplicates.csv"))),
+              pct1))
+    add(Claim("ds.removed_total", "3.3",
+              lambda: len(csv(MANIFEST / "dataset_with_duplicates.csv")) -
+                      len(dataset()), thou))
+    add(Claim("pub.agreement_at_8", "3.4",
+              lambda: pub_leak()["agreement_at_8"], pct1))
+
     # -- partitioning ---------------------------------------------------------
     add(Claim("split.imagelevel.sibling_pct", "3.4",
               lambda: sibling_rate("main_imagelevel"), pct1))
+    add(Claim("split.imagelevel.groups_spanning", "3.4",
+              lambda: int((split("main_imagelevel")
+                           .groupby("group_id").outer_fold.nunique() > 1).sum()), i))
+    add(Claim("split.imagelevel.groups_spanning_pct", "3.4",
+              lambda: 100 * (split("main_imagelevel")
+                             .groupby("group_id").outer_fold.nunique() > 1).mean(),
+              pct1))
+    add(Claim("split.imagelevel.patients_spanning_pct", "3.4",
+              lambda: 100 * (split("main_imagelevel").query("patient_id != ''")
+                             .groupby("patient_id").outer_fold.nunique() > 1).mean(),
+              pct1))
+    add(Claim("split.imagelevel.sibling_n", "3.4",
+              lambda: sibling_count("main_imagelevel"), thou))
     add(Claim("split.imagelevel.patients_spanning", "3.4",
               lambda: int((split("main_imagelevel")
                            .query("patient_id != ''")
                            .groupby("patient_id").outer_fold.nunique() > 1).sum()), i))
     add(Claim("split.grouped.sibling_pct", "3.4",
               lambda: sibling_rate("main"), lambda v: f"{v:.1f}",
-              note="must be 0.0", zero_ok=True))
+              note="invariant enforced by split.py, which aborts if violated; "
+                   "verified here rather than quoted in the text",
+              zero_ok=True, must_appear=False))
 
     # -- headline performance -------------------------------------------------
     for tag, models in [("main_finetuned_v2",
@@ -588,8 +646,13 @@ def build_claims() -> list[Claim]:
               lambda: sartaj_notumor()["unique"], i))
     add(Claim("excl.sartaj_notumor_dup_pct", "3.2",
               lambda: sartaj_notumor()["dup_pct"], pct1))
-    add(Claim("excl.sartaj_notumor_in_br35h", "3.2",
+    # Two distinct quantities: how many FILES have a hash also present in
+    # BR35H, and how many DISTINCT images that represents. The manuscript
+    # previously reported the second while describing the first.
+    add(Claim("excl.sartaj_notumor_in_br35h_files", "3.2",
               lambda: sartaj_notumor()["in_br35h"], i))
+    add(Claim("excl.sartaj_notumor_in_br35h_unique", "3.2",
+              lambda: sartaj_notumor()["in_br35h_unique"], i))
     for src in ["sartaj", "br35h"]:
         add(Claim(f"ds.raw.{src}", "3.1",
                   lambda s_=src: int((csv(MANIFEST / "files_index.csv").source == s_).sum()),
