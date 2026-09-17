@@ -363,12 +363,33 @@ def build_claims() -> list[Claim]:
                                           "concentration"), f2))
 
     # -- external screening ---------------------------------------------------
+    # PMRAM: the three scopes answer different questions and must not be
+    # pooled. An earlier audit compared against a single pool that included
+    # the composite redistribution, which inflated the apparent overlap with
+    # the source repositories from 33.8% to 56.4%.
     add(Claim("ext.pmram.files", "4.7",
-              lambda: ext_report("pmram", "files_distributed"), thou,
+              lambda: ext_report("pmram", "files"), thou,
               note="files present in the downloaded archive"))
-    add(Claim("ext.pmram.matched", "4.7",
+    add(Claim("ext.pmram.sources_matched", "4.7",
               lambda: ext_report("pmram", "scopes", "sources",
                                  "images_matched"), i))
+    add(Claim("ext.pmram.sources_pct", "4.7",
+              lambda: 100 * ext_report("pmram", "scopes", "sources",
+                                       "image_rate"), pct1))
+    add(Claim("ext.pmram.composite_matched", "4.7",
+              lambda: ext_report("pmram", "scopes", "composite",
+                                 "images_matched"), i))
+    add(Claim("ext.pmram.composite_pct", "4.7",
+              lambda: 100 * ext_report("pmram", "scopes", "composite",
+                                       "image_rate"), pct1))
+    for cls in ["glioma", "meningioma", "notumor", "pituitary"]:
+        add(Claim(f"ext.pmram.dist.{cls}", "4.7",
+                  lambda c=cls: ext_report("pmram",
+                                           "class_counts_as_distributed")[c], i))
+    add(Claim("ext.pmram.exact_dupes", "4.7",
+              lambda: ext_report("pmram", "exact_duplicate_files"), i))
+    add(Claim("ext.pmram.dupe_groups", "4.7",
+              lambda: ext_report("pmram", "exact_duplicate_groups"), i))
     add(Claim("ext.bdneuro.files", "4.7",
               lambda: ext_report("bdneuro_v7", "files"), thou))
     add(Claim("ext.bdneuro.study_images", "4.7",
