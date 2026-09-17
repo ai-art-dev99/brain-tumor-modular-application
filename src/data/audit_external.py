@@ -437,6 +437,7 @@ def main() -> None:
         "class_by_split": pd.crosstab(ext.label,
                                       ext.published_split).to_dict(),
         "exact_duplicate_files": int(len(dup_exact)),
+        "exact_duplicate_groups": int(dup_exact.sha256.nunique()),
         "near_duplicate_groups": int(n_groups),
         "published_split_integrity": split_report,
         "overlap_threshold": a.threshold,

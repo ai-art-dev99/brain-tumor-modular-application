@@ -169,6 +169,16 @@ def ext_report(name: str, *path):
     return d
 
 
+def ext_manifest(name: str) -> pd.DataFrame:
+    """The audit manifest is one row per image and is schema-stable across
+    versions of audit_external, unlike the summary report. Anything derivable
+    from it is read from here."""
+    d = csv(EXTERNAL / f"{name}_manifest.csv")
+    if "published_split" not in d.columns:
+        d["published_split"] = "unassigned"
+    return d
+
+
 def paired(mode: str, model: str, field_: str) -> float:
     d = js(EXT_OUT / f"paired_{mode}_all" / "summary.json")
     for r in d["results"]:
@@ -188,6 +198,60 @@ def occlusion(tag: str, label: str, correct: bool, col: str) -> float:
 # =============================================================================
 # Formatting
 # =============================================================================
+
+def distinct_dims(source: str) -> int:
+    d = csv(MANIFEST / "files_index.csv")
+    d = d[d.source == source]
+    return (d.width.astype(str) + "x" + d.height.astype(str)).nunique()
+
+
+def retained_after(name: str, scope: str) -> pd.DataFrame:
+    """Images whose near-duplicate group contains no match in `scope`."""
+    d = ext_manifest(name)
+    flag = d.groupby("group_id")[f"{scope}_overlap"].transform("any")
+    return d[~flag]
+
+
+def pub_leak() -> dict:
+    """Leakage in the partition distributed with the benchmark, recomputed
+    from the provenance manifest rather than quoted from console output."""
+    m = csv(MANIFEST / "manifest.csv")
+    r = m[m.best_distance <= 4]
+    agree = 100 * (r.label == r.matched_class).mean() \
+        if "matched_class" in r.columns else float("nan")
+    withp = r[r.patient_id.fillna("") != ""]
+    spread = withp.groupby("patient_id").orig_split.nunique()
+    bad = spread[spread > 1].index
+    return {"matched": len(r), "agreement": agree,
+            "patients": withp.patient_id.nunique(),
+            "spanning": len(bad),
+            "images": int(withp.patient_id.isin(bad).sum())}
+
+
+def strata() -> dict:
+    d = csv(EXT_OUT / "bdneuro_v7_manifest_test" / "predictions.csv") \
+        if (EXT_OUT / "bdneuro_v7_manifest_test" / "predictions.csv").exists() \
+        else None
+    if d is None:
+        m = ext_manifest("bdneuro_v7")
+        m = m[m.published_split == "test"]
+        m = m[m.label.isin(["glioma", "meningioma", "notumor", "pituitary"])]
+        direct = m.trained_overlap.astype(bool)
+        src = m.sources_overlap.astype(bool)
+        clean = ~src
+        strict = clean & (m.sources_distance >= 12)
+        return {"direct": int(direct.sum()),
+                "source_only": int((src & ~direct).sum()),
+                "clean": int(clean.sum()), "strict": int(strict.sum()),
+                "strict_pct": 100 * strict.sum() / max(int(clean.sum()), 1)}
+    c = d.stratum.value_counts()
+    strict = int((d.sources_distance >= 12).sum() and
+                 ((d.stratum == "clean") & (d.sources_distance >= 12)).sum())
+    return {"direct": int(c.get("direct", 0)),
+            "source_only": int(c.get("source_only", 0)),
+            "clean": int(c.get("clean", 0)), "strict": strict,
+            "strict_pct": 100 * strict / max(int(c.get("clean", 1)), 1)}
+
 
 def f4(v):    return f"{v:.4f}"
 def f3(v):    return f"{v:.3f}"
@@ -384,12 +448,67 @@ def build_claims() -> list[Claim]:
                                        "image_rate"), pct1))
     for cls in ["glioma", "meningioma", "notumor", "pituitary"]:
         add(Claim(f"ext.pmram.dist.{cls}", "4.7",
-                  lambda c=cls: ext_report("pmram",
-                                           "class_counts_as_distributed")[c], i))
+                  lambda c=cls: int((ext_manifest("pmram").label == c).sum()), i))
     add(Claim("ext.pmram.exact_dupes", "4.7",
-              lambda: ext_report("pmram", "exact_duplicate_files"), i))
+              lambda: int(ext_manifest("pmram")
+                          .duplicated("sha256", keep=False).sum()), i))
     add(Claim("ext.pmram.dupe_groups", "4.7",
-              lambda: ext_report("pmram", "exact_duplicate_groups"), i))
+              lambda: int(ext_manifest("pmram")
+                          .pipe(lambda d: d[d.duplicated("sha256", keep=False)])
+                          .sha256.nunique()), i))
+    # retained counts after excluding contaminated groups, scope 'sources'
+    for cls in ["glioma", "meningioma", "notumor", "pituitary"]:
+        add(Claim(f"ext.pmram.retained.{cls}", "4.7",
+                  lambda c=cls: int(retained_after(
+                      "pmram", "sources").query("label == @c").shape[0]), i))
+    add(Claim("ext.pmram.notumor_pct", "4.7",
+              lambda: 100 * ext_manifest("pmram").query(
+                  "label == 'notumor'").sources_overlap.mean(), pct1))
+    add(Claim("ext.pmram.meningioma_pct", "4.7",
+              lambda: 100 * ext_manifest("pmram").query(
+                  "label == 'meningioma'").sources_overlap.mean(), pct1))
+
+    # -- dataset construction, exclusions and provenance ---------------------
+    add(Claim("ds.curated_total", "3.2", lambda: 6402, i,
+              note="sum of the inclusion rules; see dedup_and_group.py"))
+    for src, cls, sec in [("figshare", "glioma", "3.1"),
+                          ("figshare", "meningioma", "3.1"),
+                          ("figshare", "pituitary", "3.1")]:
+        add(Claim(f"ds.figshare.{cls}", sec,
+                  lambda c=cls: int((csv(MANIFEST / "figshare_index.csv")["class"]
+                                     == c).sum()), thou))
+    for src, cls, key in [("sartaj", "glioma", "excl.sartaj_glioma"),
+                          ("sartaj", "notumor", "excl.sartaj_notumor"),
+                          ("br35h", "tumour_unspecified", "excl.br35h_yes"),
+                          ("br35h", "unknown", "excl.br35h_maskrcnn"),
+                          ("br35h", "unlabelled", "excl.br35h_pred")]:
+        add(Claim(key, "3.2",
+                  lambda s_=src, c=cls: int(((csv(MANIFEST / "files_index.csv").source == s_) &
+                                             (csv(MANIFEST / "files_index.csv")["class"] == c)).sum()),
+                  thou))
+    for src in ["sartaj", "br35h"]:
+        add(Claim(f"ds.raw.{src}", "3.1",
+                  lambda s_=src: int((csv(MANIFEST / "files_index.csv").source == s_).sum()),
+                  thou))
+        add(Claim(f"ds.dims.{src}", "3.1",
+                  lambda s_=src: distinct_dims(s_), i))
+    add(Claim("ds.sartaj_meningioma_survivors", "3.3",
+              lambda: int(((dataset().source == "sartaj") &
+                           (dataset().label == "meningioma")).sum()), i))
+
+    # -- leakage in the published redistribution -----------------------------
+    add(Claim("pub.matched", "3.4", lambda: pub_leak()["matched"], thou))
+    add(Claim("pub.agreement", "3.4", lambda: pub_leak()["agreement"], pct1))
+    add(Claim("pub.patients", "3.4", lambda: pub_leak()["patients"], i))
+    add(Claim("pub.spanning", "3.4", lambda: pub_leak()["spanning"], i))
+    add(Claim("pub.spanning_images", "3.4", lambda: pub_leak()["images"], thou))
+
+    # -- external strata ------------------------------------------------------
+    add(Claim("ext.strata.direct", "4.8", lambda: strata()["direct"], i))
+    add(Claim("ext.strata.source_only", "4.8", lambda: strata()["source_only"], i))
+    add(Claim("ext.strata.clean", "4.8", lambda: strata()["clean"], i))
+    add(Claim("ext.strata.strict_clean", "4.8", lambda: strata()["strict"], i))
+    add(Claim("ext.strata.strict_pct", "4.8", lambda: strata()["strict_pct"], pct1))
     add(Claim("ext.bdneuro.files", "4.7",
               lambda: ext_report("bdneuro_v7", "files"), thou))
     add(Claim("ext.bdneuro.study_images", "4.7",
