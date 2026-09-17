@@ -375,7 +375,7 @@ def read_doc(path: Path) -> str:
         return ""
     if path.suffix.lower() == ".docx":
         try:
-            return subprocess.run(["pandoc", "-t", "plain", str(path)],
+            return subprocess.run(["", "-t", "plain", str(path)],
                                   capture_output=True, text=True,
                                   check=True).stdout
         except Exception as e:
