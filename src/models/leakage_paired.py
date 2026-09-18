@@ -110,7 +110,7 @@ def _packed(series) -> np.ndarray:
 
 
 def exposure_matrix(ext: pd.DataFrame, dev: pd.DataFrame, manifest_dir: Path,
-                    threshold: int, n_folds: int) -> np.ndarray:
+                    threshold: int, n_folds: int):
     """
     (n_folds, n_images) boolean: did fold k's training data contain ANY image
     within `threshold` of this external image?
@@ -136,7 +136,13 @@ def exposure_matrix(ext: pd.DataFrame, dev: pd.DataFrame, manifest_dir: Path,
     dp, dd = _packed(d.phash), _packed(d.dhash)
     dev_fold = d.outer_fold.to_numpy()
 
+    dev_group = d.group_id.to_numpy()
     exposed = np.zeros((n_folds, len(ext)), dtype=bool)
+    # Which development leakage-control groups each external image matches.
+    # Two external images matching the same development group are not
+    # independent observations of the effect, so this is what the cluster
+    # bootstrap below resamples over.
+    matched_groups: list[set] = []
     for s0 in range(0, len(ext), 256):
         e0 = min(s0 + 256, len(ext))
         m = np.maximum(
@@ -146,10 +152,49 @@ def exposure_matrix(ext: pd.DataFrame, dev: pd.DataFrame, manifest_dir: Path,
         for k in range(n_folds):
             # fold k trains on everything outside fold k
             exposed[k, s0:e0] = m[:, dev_fold != k].any(axis=1)
-    return exposed
+        for row in m:
+            matched_groups.append(set(dev_group[row]))
+    return exposed, matched_groups
 
 
-def paired_bootstrap(seen, unseen, n=4000, seed=42, alpha=0.05):
+class DSU:
+    """Disjoint-set union, used to join external images that share a
+    development counterpart."""
+
+    def __init__(self, n: int):
+        self.p = list(range(n))
+
+    def find(self, x: int) -> int:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+def cluster_ids(matched_groups: list[set]) -> np.ndarray:
+    """Connected components over external images sharing a development group.
+
+    If image A and image B both match development group g, and B also matches
+    h, then A, B and anything else touching h form one cluster. Treating them
+    as independent would understate the interval.
+    """
+    group_to_first: dict = {}
+    dsu = DSU(len(matched_groups))
+    for i, gs in enumerate(matched_groups):
+        for g in gs:
+            if g in group_to_first:
+                dsu.union(group_to_first[g], i)
+            else:
+                group_to_first[g] = i
+    return np.array([dsu.find(i) for i in range(len(matched_groups))])
+
+
+def paired_bootstrap(seen, unseen, n=4000, seed=42, alpha=0.05, clusters=None):
     """
     Bootstrap the difference in accuracy between models that saw an image's
     counterpart and the model that did not, resampling images. `seen` holds
@@ -158,8 +203,19 @@ def paired_bootstrap(seen, unseen, n=4000, seed=42, alpha=0.05):
     """
     rng = np.random.default_rng(seed)
     d = seen - unseen
-    draws = np.array([d[rng.integers(0, len(d), len(d))].mean()
-                      for _ in range(n)])
+    if clusters is None:
+        draws = np.array([d[rng.integers(0, len(d), len(d))].mean()
+                          for _ in range(n)])
+    else:
+        # Cluster bootstrap: resample whole counterpart clusters, so images
+        # that share a development counterpart move together.
+        uniq = np.unique(clusters)
+        idx = {c: np.where(clusters == c)[0] for c in uniq}
+        draws = np.empty(n)
+        for b in range(n):
+            take = rng.choice(uniq, size=len(uniq), replace=True)
+            sel = np.concatenate([idx[c] for c in take])
+            draws[b] = d[sel].mean()
     lo, hi = np.percentile(draws, [100 * alpha / 2, 100 * (1 - alpha / 2)])
     # (extreme + 1) / (n + 1): a bootstrap of n resamples cannot resolve a
     # p-value below 1/(n+1), and printing 0.0000 asserts more than the
@@ -180,6 +236,10 @@ def main() -> None:
     ap.add_argument("--heads", nargs="*", default=["svm", "logreg"])
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--bootstrap-unit", choices=["image", "cluster"],
+                    default="image",
+                    help="resampling unit for the interval. Use 'cluster' if "
+                         "the diagnostic reports images sharing a counterpart.")
     ap.add_argument("--match-threshold", type=int, default=2,
                     help="dual-hash distance defining a counterpart; keep at "
                          "the value calibrated on the development data")
@@ -224,6 +284,8 @@ def main() -> None:
         exposed = np.ones((n_folds, len(ext)), dtype=bool)
         exposed[rng.integers(0, n_folds, len(ext)), np.arange(len(ext))] = False
         ext["n_exposed_folds"] = exposed.sum(0)
+        ext["n_matched_dev_groups"] = 0
+        ext["cluster_id"] = np.arange(len(ext))   # no counterpart, no clustering
     else:
         ext = ext[ext.trained_overlap.astype(bool)].reset_index(drop=True)
         if not len(ext):
@@ -231,15 +293,18 @@ def main() -> None:
         # Folds are group-disjoint, so the unit held out is the counterpart's
         # whole leakage-control group, not a single image: around 16 images for
         # glioma, around 2 for no-tumour. Describe it that way when reporting.
-        exposed = exposure_matrix(ext, dev, MANIFEST, a.match_threshold,
-                                  n_folds)
+        exposed, matched_groups = exposure_matrix(ext, dev, MANIFEST,
+                                                  a.match_threshold, n_folds)
         # An image whose counterparts appear in every fold's training data has
         # no unexposed backbone and cannot serve as its own control.
         usable = (~exposed).any(axis=0) & exposed.any(axis=0)
         dropped = int((~usable).sum())
         ext = ext[usable].reset_index(drop=True)
         exposed = exposed[:, usable]
+        matched_groups = [g for g, u in zip(matched_groups, usable) if u]
         ext["n_exposed_folds"] = exposed.sum(0)
+        ext["n_matched_dev_groups"] = [len(g) for g in matched_groups]
+        ext["cluster_id"] = cluster_ids(matched_groups)
 
     mode = "NEGATIVE CONTROL" if a.control else "paired leakage test"
     print(f"==> {mode}: {len(ext)} images"
@@ -249,6 +314,27 @@ def main() -> None:
         print("  the fold labels are random. The expected difference is zero.")
     print("\n  backbones exposed to a counterpart, per image:")
     print(ext.n_exposed_folds.value_counts().sort_index().to_string())
+    if not a.control:
+        sizes = ext.groupby("cluster_id").size()
+        n_cl = int(sizes.nunique() and sizes.index.nunique())
+        print(f"\n  independence of the {len(ext)} images:")
+        print(f"    distinct counterpart clusters : {n_cl}")
+        print(f"    images per cluster            : min {sizes.min()}  "
+              f"median {sizes.median():.0f}  mean {sizes.mean():.2f}  "
+              f"max {sizes.max()}")
+        print(f"    clusters holding one image    : {int((sizes == 1).sum())}")
+        print(f"    images in multi-image clusters: {int(sizes[sizes > 1].sum())}")
+        if sizes.max() == 1:
+            print("    -> every image maps to a distinct counterpart cluster, so")
+            print("       resampling images is resampling independent units and")
+            print("       the image-level bootstrap is appropriate.")
+        else:
+            print("    -> some images share a counterpart, so they are not")
+            print("       independent observations of the effect. Use")
+            print("       --bootstrap-unit cluster; the image-level interval")
+            print("       would be too narrow.")
+            print(sizes.sort_values(ascending=False).head(10).to_string())
+
     print("\n  by class:")
     print(ext.label.value_counts().to_string())
     if a.control:
@@ -337,7 +423,10 @@ def main() -> None:
         seen = (C & with_m).sum(0) / n_with
         unseen = (C & without_m).sum(0) / n_without
 
-        d, lo, hi, p = paired_bootstrap(seen, unseen, a.bootstrap, a.seed)
+        cl = (ext.cluster_id.to_numpy()
+              if a.bootstrap_unit == "cluster" else None)
+        d, lo, hi, p = paired_bootstrap(seen, unseen, a.bootstrap, a.seed,
+                                        clusters=cl)
         cS = ((conf[n] * with_m).sum(0) / n_with).mean()
         cU = ((conf[n] * without_m).sum(0) / n_without).mean()
 
@@ -394,7 +483,9 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     t.to_csv(out / "paired_contrast.csv", index=False)
     per_image = {"path": ext.path, "label": y,
-                 "n_exposed_folds": n_with, "n_unexposed_folds": n_without}
+                 "n_exposed_folds": n_with, "n_unexposed_folds": n_without,
+                 "n_matched_dev_groups": ext.n_matched_dev_groups,
+                 "cluster_id": ext.cluster_id}
     for n in names:
         per_image[f"{n}_acc_exposed"] = (correct[n] & with_m).sum(0) / n_with
         per_image[f"{n}_acc_unexposed"] = (correct[n] & without_m).sum(0) / n_without
@@ -405,6 +496,9 @@ def main() -> None:
         "n_images": len(ext), "dropped": dropped, "n_folds": n_folds,
         "bootstrap": a.bootstrap, "p_floor": p_floor,
         "match_threshold": a.match_threshold,
+        "bootstrap_unit": a.bootstrap_unit,
+        "counterpart_clusters": int(ext.cluster_id.nunique()),
+        "max_images_per_cluster": int(ext.groupby("cluster_id").size().max()),
         "exposed_fold_counts": ext.n_exposed_folds.value_counts().to_dict(),
         "class_counts": ext.label.value_counts().to_dict(),
         "results": table}, indent=2, default=str))
